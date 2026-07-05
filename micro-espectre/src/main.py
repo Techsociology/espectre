@@ -12,20 +12,18 @@ import time
 import gc
 import os
 from src.mvs_detector import MVSDetector
-from src.ml_detector import MLDetector
+from src.ml_detector import MLDetector, ML_DEFAULT_THRESHOLD, ML_METRIC_SCALE
 from src.mqtt.handler import MQTTHandler
 from src.traffic_generator import TrafficGenerator
+from src.runtime_policy import RuntimeMotionPolicy
 import src.config as config
-
-# Default subcarriers (used if not configured or for fallback in case of error)
-DEFAULT_SUBCARRIERS = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
 
 # Gain lock configuration
 GAIN_LOCK_PACKETS = 300  # ~3 seconds at 100 Hz
 
 # Import HT20 constants from config
 from src.config import NUM_SUBCARRIERS, EXPECTED_CSI_LEN, SEG_THRESHOLD
-from src.utils import calculate_gain_compensation, to_signed_int8, calculate_median
+from src.utils import to_signed_int8, calculate_median, normalize_ht20_csi_payload
 
 # Global state for calibration mode and performance metrics
 class GlobalState:
@@ -34,10 +32,8 @@ class GlobalState:
         self.loop_time_us = 0  # Last loop iteration time in microseconds
         self.chip_type = None  # Detected chip type (S3, C6, etc.)
         self.current_channel = 0  # Track WiFi channel for change detection
-        # Gain compensation state (when gain lock is skipped or disabled)
-        self.needs_compensation = False
-        self.baseline_agc = 0  # uint8
-        self.baseline_fft = 0  # int8 (signed)
+        # CV normalization state (when gain lock is skipped or disabled)
+        self.needs_cv_normalization = False
 
 
 g_state = GlobalState()
@@ -60,7 +56,7 @@ def cleanup_wifi(wlan):
     # Disable CSI first (may fail if not enabled, that's ok)
     try:
         wlan.csi_disable()
-    except:
+    except Exception:
         pass
     
     # Disconnect if connected
@@ -112,6 +108,13 @@ def connect_wifi():
     
     # Wait for hardware initialization
     time.sleep(2)
+
+    # Dual-band targets (e.g. ESP32-C5/C6): force 2.4GHz for stable CSI capture.
+    try:
+        wlan.config(band_mode=wlan.BAND_MODE_2G_ONLY)
+    except Exception:
+        # Legacy/single-band firmware may not expose band_mode.
+        pass
         
     # Configure WiFi protocol
     # Force WiFi 4 (802.11b/g/n) only to get 64 subcarriers
@@ -122,9 +125,17 @@ def connect_wifi():
     # Enable CSI after WiFi is stable
     wlan.csi_enable(buffer_size=config.CSI_BUFFER_SIZE)
     
-    # Connect
-    print(f"Connecting to WiFi...")
-    wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD)
+    # Connect (optionally locked to a specific BSSID)
+    bssid_hex = getattr(config, 'WIFI_BSSID', None)
+    bssid = None
+    if bssid_hex:
+        # Accept "AABBCCDDEEFF" or "AA:BB:CC:DD:EE:FF"
+        bssid_clean = bssid_hex.replace(':', '').replace('-', '')
+        if len(bssid_clean) == 12:
+            bssid = bytes.fromhex(bssid_clean)
+    bssid_info = f" (BSSID: {bssid_hex})" if bssid else ""
+    print(f"Connecting to WiFi{bssid_info}...")
+    wlan.connect(config.WIFI_SSID, config.WIFI_PASSWORD, bssid=bssid)
     
     # Wait for connection
     timeout = 30
@@ -147,17 +158,18 @@ def format_progress_bar(score, threshold, width=20, is_probability=False):
     """Format progress bar for console output.
     
     For MVS: score = metric/threshold, threshold_pos at 75% (15/20)
-    For ML: score = probability, threshold_pos at threshold (e.g., 50% for 0.5)
+    For ML: score/threshold are on the detector's 0-10 scale.
     """
     if is_probability:
-        # ML mode: threshold is a probability (0-1), show it at its actual position
-        threshold_pos = int(threshold * width)
-        filled = int(score * width)
+        # ML mode: threshold and score are already scaled to 0-10.
+        threshold_pos = int((threshold / ML_METRIC_SCALE) * width)
+        filled = int((score / ML_METRIC_SCALE) * width)
     else:
         # MVS mode: score is already normalized (metric/threshold)
         threshold_pos = 15  # 75% position
         filled = int(score * threshold_pos)
     
+    threshold_pos = max(0, min(threshold_pos, width - 1))
     filled = max(0, min(filled, width))
     
     bar = '['
@@ -170,7 +182,10 @@ def format_progress_bar(score, threshold, width=20, is_probability=False):
             bar += '░'
     bar += ']'
     
-    percent = int(score * 100)
+    if is_probability:
+        percent = int((score / threshold) * 100) if threshold > 0 else 0
+    else:
+        percent = int(score * 100)
     return f"{bar} {percent}%"
 
 
@@ -187,14 +202,14 @@ def run_gain_lock(wlan):
     Respects config.GAIN_LOCK_MODE:
     - "auto": Lock gain, but skip if signal too strong (AGC < MIN_SAFE_AGC)
     - "enabled": Always force gain lock
-    - "disabled": Collect baseline for compensation, but no lock
+    - "disabled": No gain lock, use CV normalization
     
     Args:
         wlan: WLAN instance with CSI enabled
         
     Returns:
-        tuple: (agc_gain, fft_gain, needs_compensation) where:
-            - needs_compensation=True if gain lock was skipped/disabled
+        tuple: (agc_gain, fft_gain, needs_cv_normalization) where:
+            - needs_cv_normalization=True if gain lock was skipped/disabled
     """
     # Check configuration mode
     mode = getattr(config, 'GAIN_LOCK_MODE', 'auto').lower()
@@ -206,7 +221,9 @@ def run_gain_lock(wlan):
     if not gain_lock_supported:
         print(f"Gain lock: Not supported on this platform")
         print(f"  HT20 mode: {NUM_SUBCARRIERS} subcarriers")
-        return None, None, False
+        print("  CV normalization enabled")
+        # No hardware gain lock support -> must use CV normalization.
+        return None, None, True
     
     print('')
     print('-'*60)
@@ -247,15 +264,15 @@ def run_gain_lock(wlan):
     
     # Handle different modes
     if mode == 'disabled':
-        # DISABLED mode: baseline collected for compensation, but no gain lock
-        print(f"Gain baseline: AGC={median_agc}, FFT={median_fft} (compensation enabled, no lock)")
+        # DISABLED mode: no gain lock, use CV normalization
+        print(f"Gain baseline: AGC={median_agc}, FFT={median_fft} (no lock, CV normalization enabled)")
         return median_agc, median_fft, True
     
     # In auto mode, skip gain lock if signal is too strong
     if mode == 'auto' and median_agc < min_safe_agc:
         print(f"WARNING: Signal too strong (AGC={median_agc} < {min_safe_agc}) - skipping gain lock")
         print(f"         Move sensor 2-3 meters from AP for optimal performance")
-        print(f"         Compensation enabled for baseline: AGC={median_agc}, FFT={median_fft}")
+        print(f"         CV normalization enabled (baseline: AGC={median_agc}, FFT={median_fft})")
         return median_agc, median_fft, True
     
     # Lock the gain values
@@ -278,6 +295,9 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
     Returns:
         bool: True if calibration successful
     """
+    # Get calibration algorithm from config (default: nbvi)
+    algorithm = getattr(config, 'CALIBRATION_ALGORITHM', 'nbvi').lower()
+    
     # Determine calibration type based on detector
     detector_name = detector.get_name()
     is_ml = detector_name == "ML"
@@ -298,26 +318,26 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         print('Please remain still for gain lock...')
         
         # Phase 1: Gain Lock only (~3 seconds)
-        agc, fft, needs_comp = run_gain_lock(wlan)
+        agc, fft, needs_cv = run_gain_lock(wlan)
         
-        # Save baseline for compensation if needed
+        # Save CV normalization state
         if agc is not None and fft is not None:
-            g_state.needs_compensation = needs_comp
-            g_state.baseline_agc = agc
-            g_state.baseline_fft = fft
+            g_state.needs_cv_normalization = needs_cv
         
-        if needs_comp:
-            print("Note: Proceeding without gain lock (compensation enabled)")
+        if needs_cv:
+            print("Note: Proceeding without gain lock (CV normalization enabled)")
         
-        # Use ML-specific subcarriers (must match model training)
-        from src.ml_detector import ML_SUBCARRIERS
-        config.SELECTED_SUBCARRIERS = ML_SUBCARRIERS
+        # CV normalization: only needed when gain is not locked
+        detector.set_cv_normalization(needs_cv)
+        
+        # Use unified default subcarriers from central config
+        config.SELECTED_SUBCARRIERS = config.DEFAULT_SUBCARRIERS
         
         print('')
         print('='*60)
         print('ML Quick Boot Complete!')
         print(f'   Subcarriers: {config.SELECTED_SUBCARRIERS}')
-        print(f'   Threshold: 0.5 (probability)')
+        print(f'   Threshold: {detector.get_threshold():.1f} (scaled 0-10 score)')
         print(f'   Total boot time: ~3 seconds (gain lock only)')
         print('='*60)
         print('')
@@ -325,12 +345,7 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         g_state.calibration_mode = False
         return True
     else:
-        # Get configured algorithm for MVS
-        algorithm = getattr(config, 'CALIBRATION_ALGORITHM', 'nbvi').lower()
-        if algorithm == 'nbvi':
-            from src.nbvi_calibrator import NBVICalibrator, cleanup_buffer_file
-        else:
-            from src.p95_calibrator import P95Calibrator, cleanup_buffer_file
+        from src.nbvi_calibrator import NBVICalibrator, cleanup_buffer_file
     
     # Set calibration mode to suspend main loop
     g_state.calibration_mode = True
@@ -346,49 +361,68 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
     print('Two-Phase Calibration Starting')
     print('='*60)
     print(f'Free memory: {gc.mem_free()} bytes')
-    print(f'Algorithm: {algorithm.upper()}')
     print('Please remain still for calibration...')
     
     # Phase 1: Gain Lock (~3 seconds)
     # Stabilizes AGC/FFT before calibration to ensure clean data
-    agc, fft, needs_comp = run_gain_lock(wlan)
+    agc, fft, needs_cv = run_gain_lock(wlan)
     
-    # Save baseline for compensation if needed
+    # Save CV normalization state
     if agc is not None and fft is not None:
-        g_state.needs_compensation = needs_comp
-        g_state.baseline_agc = agc
-        g_state.baseline_fft = fft
+        g_state.needs_cv_normalization = needs_cv
     
-    if needs_comp:
-        print("Note: Proceeding with band calibration without gain lock (compensation enabled)")
+    if needs_cv:
+        print("Note: Proceeding with band calibration without gain lock (CV normalization enabled)")
+    
+    # CV normalization: only needed when gain is not locked
+    detector.set_cv_normalization(needs_cv)
     
     print('')
     print('-'*60)
     print(f'Band Calibration (~7 seconds) [HT20: {NUM_SUBCARRIERS} SC]')
     print('-'*60)
     
-    # Initialize calibrator based on algorithm
-    if algorithm == 'nbvi':
-        calibrator = NBVICalibrator(buffer_size=config.CALIBRATION_BUFFER_SIZE)
-    else:
-        calibrator = P95Calibrator(buffer_size=config.CALIBRATION_BUFFER_SIZE)
+    # Initialize NBVI calibrator
+    calibrator = NBVICalibrator(buffer_size=config.CALIBRATION_BUFFER_SIZE)
+    
+    # Match calibrator's normalization mode with detector
+    calibrator.use_cv_normalization = needs_cv
     
     # Collect packets for calibration (now with stable gain)
     calibration_progress = 0
     timeout_counter = 0
     max_timeout = 15000  # 15 seconds
     packets_read = 0
+    filtered_count = 0
     last_progress_time = time.ticks_ms()
     last_progress_count = 0
+    collapse_logged = False
+    remap_logged = False
+    ht57_remap_buffer = bytearray(EXPECTED_CSI_LEN)
     
     while calibration_progress < config.CALIBRATION_BUFFER_SIZE:
         frame = wlan.csi_read()
         packets_read += 1
         
         if frame:
-            # HT20: 64 SC × 2 bytes = 128 bytes
-            csi_data = frame[5][:EXPECTED_CSI_LEN]
-            del frame  # Free memory immediately
+            csi_data, raw_len, remap_tag = normalize_ht20_csi_payload(
+                frame[5], EXPECTED_CSI_LEN, remap_buffer=ht57_remap_buffer
+            )
+
+            if csi_data is None:
+                filtered_count += 1
+                if filtered_count % 100 == 1:
+                    print(f"[WARN] Filtered {filtered_count} packets with wrong SC count (got {raw_len} bytes, expected {EXPECTED_CSI_LEN})")
+                del frame
+                continue
+
+            if remap_tag in ('double_ht20', 'double_ht57_and_remap') and not collapse_logged:
+                print("[INFO] CSI double-length collapse active: 256->128 and/or 228->114")
+                collapse_logged = True
+            if remap_tag in ('ht57_to_64', 'double_ht57_and_remap') and not remap_logged:
+                print("[INFO] CSI remap active: 57->64 SC (left_pad=4, right_pad=3)")
+                remap_logged = True
+            del frame
             calibration_progress = calibrator.add_packet(csi_data)
             timeout_counter = 0  # Reset timeout on successful read
             
@@ -416,7 +450,7 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
     
     # Run calibration (both algorithms now return adaptive_threshold)
     success = False
-    config.SELECTED_SUBCARRIERS = DEFAULT_SUBCARRIERS
+    config.SELECTED_SUBCARRIERS = config.DEFAULT_SUBCARRIERS
     
     # Stop traffic generator during band evaluation to free memory
     tg_was_running = traffic_gen.is_running()
@@ -428,67 +462,66 @@ def run_band_calibration(wlan, detector, traffic_gen, chip_type=None):
         # Calibrator returns: calibrate() -> (band, values)
         # band = selected subcarriers, values = mv_values
         selected_band, cal_values = calibrator.calibrate()
-        
-        if selected_band and len(selected_band) == 12:
-            config.SELECTED_SUBCARRIERS = selected_band
-            
-            if is_ml:
-                # ML: subcarriers only, threshold stays at 0.5
-                threshold_source = "fixed (0.5)"
-                success = True
-                
-                print('')
-                print('='*60)
-                print('ML Subcarrier Calibration Successful!')
-                print(f'   Algorithm: {algorithm.upper()} (subcarrier selection only)')
-                print(f'   Selected band: {selected_band}')
-                print(f'   Threshold: {detector.get_threshold():.2f} ({threshold_source})')
-                print('='*60)
-                print('')
-            else:
-                # MVS: apply adaptive threshold from MV values
-                from src.threshold import calculate_adaptive_threshold
-                
-                if isinstance(SEG_THRESHOLD, str):
-                    # "auto" or "min" mode - calculate adaptive threshold
-                    adaptive_threshold, percentile, factor, pxx = calculate_adaptive_threshold(cal_values, SEG_THRESHOLD)
-                    detector.set_adaptive_threshold(adaptive_threshold)
-                    threshold_source = f"{SEG_THRESHOLD} (P{percentile}x{factor})"
-                    print(f'Adaptive threshold: {adaptive_threshold:.4f} ({threshold_source})')
-                else:
-                    # Numeric value - use fixed manual threshold
-                    adaptive_threshold, _, _, _ = calculate_adaptive_threshold(cal_values, "auto")
-                    detector.set_threshold(float(SEG_THRESHOLD))
-                    threshold_source = "manual"
-                    print(f'Manual threshold: {SEG_THRESHOLD:.2f} (adaptive would be: {adaptive_threshold:.4f})')
-                
-                success = True
-                
-                print('')
-                print('='*60)
-                print('Subcarrier Calibration Successful!')
-                print(f'   Algorithm: {algorithm.upper()}')
-                print(f'   Selected band: {selected_band}')
-                print(f'   Threshold: {detector.get_threshold():.4f} ({threshold_source})')
-                print('='*60)
-                print('')
-        else:
-            # Calibration failed - keep default
-            print('')
-            print('='*60)
-            print('Subcarrier Calibration Failed')
-            print(f'   Using default band: {config.SELECTED_SUBCARRIERS}')
-            print('='*60)
-            print('')
-    
     except Exception as e:
         print(f"Error during calibration: {e}")
-        print(f"Using default band: {config.SELECTED_SUBCARRIERS}")
+        selected_band, cal_values = None, []
     
-    # Free calibrator memory explicitly
+    # Free calibrator memory BEFORE threshold calculation (C3 needs the headroom)
     calibrator.free_buffer()
     calibrator = None
     gc.collect()
+    
+    if selected_band and len(selected_band) == 12:
+        config.SELECTED_SUBCARRIERS = selected_band
+        
+        if is_ml:
+            threshold_source = f"fixed ({detector.get_threshold():.1f})"
+            success = True
+            
+            print('')
+            print('='*60)
+            print('ML Subcarrier Calibration Successful!')
+            print(f'   Algorithm: {algorithm.upper()} (subcarrier selection only)')
+            print(f'   Selected band: {selected_band}')
+            print(f'   Threshold: {detector.get_threshold():.2f} ({threshold_source})')
+            print('='*60)
+            print('')
+        else:
+            # MVS: apply adaptive threshold from MV values
+            from src.threshold import calculate_adaptive_threshold
+            
+            if isinstance(SEG_THRESHOLD, str):
+                adaptive_threshold, percentile = calculate_adaptive_threshold(cal_values, SEG_THRESHOLD)
+                detector.set_adaptive_threshold(adaptive_threshold)
+                threshold_source = f"{SEG_THRESHOLD} (P{percentile})"
+                print(f'Adaptive threshold: {adaptive_threshold:.4f} ({threshold_source})')
+            else:
+                adaptive_threshold, _ = calculate_adaptive_threshold(cal_values, "auto")
+                detector.set_threshold(float(SEG_THRESHOLD))
+                threshold_source = "manual"
+                print(f'Manual threshold: {SEG_THRESHOLD:.2f} (adaptive would be: {adaptive_threshold:.4f})')
+            
+            del cal_values
+            gc.collect()
+            
+            success = True
+            
+            print('')
+            print('='*60)
+            print('Subcarrier Calibration Successful!')
+            print(f'   Algorithm: {algorithm.upper()}')
+            print(f'   Selected band: {selected_band}')
+            print(f'   Threshold: {detector.get_threshold():.4f} ({threshold_source})')
+            print('='*60)
+            print('')
+    else:
+        print(f"Using default band: {config.SELECTED_SUBCARRIERS}")
+        print('')
+        print('='*60)
+        print('Subcarrier Calibration Failed')
+        print(f'   Using default band: {config.SELECTED_SUBCARRIERS}')
+        print('='*60)
+        print('')
     
     # Restart traffic generator if it was running
     if tg_was_running:
@@ -535,7 +568,7 @@ def main():
         print(f'Detection algorithm: ML (Neural Network)')
         detector = MLDetector(
             window_size=config.SEG_WINDOW_SIZE,
-            threshold=0.5,  # Probability threshold
+            threshold=ML_DEFAULT_THRESHOLD,
             enable_lowpass=config.ENABLE_LOWPASS_FILTER,
             lowpass_cutoff=config.LOWPASS_CUTOFF,
             enable_hampel=config.ENABLE_HAMPEL_FILTER,
@@ -556,7 +589,8 @@ def main():
     
     # Initialize and start traffic generator (rate is static from config.py)
     gc.collect()  # Free memory before creating socket
-    traffic_gen = TrafficGenerator()
+    traffic_mode = getattr(config, 'TRAFFIC_GENERATOR_MODE', 'ping')
+    traffic_gen = TrafficGenerator(mode=traffic_mode)
     if config.TRAFFIC_GENERATOR_RATE > 0:
         if not traffic_gen.start(config.TRAFFIC_GENERATOR_RATE):
             print("FATAL: Traffic generator failed to start - CSI will not work")
@@ -565,7 +599,7 @@ def main():
             time.sleep(5)
             machine.reset()  # Reboot and retry
         
-        print(f'Traffic generator started ({config.TRAFFIC_GENERATOR_RATE} pps)')
+        print(f'Traffic generator started ({traffic_mode}, {config.TRAFFIC_GENERATOR_RATE} pps)')
         
         # Verify CSI packets are flowing with retry logic
         max_tg_retries = 3
@@ -591,7 +625,10 @@ def main():
                 time.sleep(1)
                 traffic_gen.start(config.TRAFFIC_GENERATOR_RATE)
             else:
-                print(f'WARNING: Only {csi_received} CSI packets after {max_tg_retries} attempts - TG may not be working')
+                print(f'FATAL: No CSI packets after {max_tg_retries} attempts - cannot operate without traffic')
+                print('Please check WiFi connection and retry')
+                import sys
+                sys.exit(1)
     
     # P95 Auto-Calibration at boot if subcarriers not configured
     # Handle case where SELECTED_SUBCARRIERS is None, empty, or not defined (commented out)
@@ -628,12 +665,22 @@ def main():
     
     # Main CSI processing loop with integrated MQTT publishing
     publish_counter = 0
+    mqtt_poll_counter = 0
     last_dropped = 0
     filtered_count = 0  # Packets with wrong SC count
     last_publish_time = time.ticks_ms()
+    collapse_logged = False
+    remap_logged = False
+    ht57_remap_buffer = bytearray(EXPECTED_CSI_LEN)
     
-    # Calculate optimal sleep based on traffic rate
-    publish_rate = traffic_gen.get_rate() if traffic_gen.is_running() else 100
+    publish_rate = getattr(config, 'PUBLISH_INTERVAL', None)
+    if publish_rate is None:
+        publish_rate = traffic_gen.get_rate() if traffic_gen.is_running() else 100
+    runtime_policy = RuntimeMotionPolicy(
+        evaluation_interval=getattr(config, 'EVALUATION_INTERVAL', 25),
+        motion_on_hits=getattr(config, 'MOTION_ON_HITS', 3),
+        motion_off_hits=getattr(config, 'MOTION_OFF_HITS', 3),
+    )
        
     try:
         while True:
@@ -644,86 +691,91 @@ def main():
                 time.sleep_ms(1000) # Sleep for 1 second to yield CPU
                 continue
             
-            # Check MQTT messages (non-blocking)
-            mqtt_handler.check_messages()
-            
             frame = wlan.csi_read()
             
             if frame:
-                # Filter packets by expected CSI length (HT20: 128 bytes)
-                if len(frame[5]) != EXPECTED_CSI_LEN:
+                csi_data, raw_len, remap_tag = normalize_ht20_csi_payload(
+                    frame[5], EXPECTED_CSI_LEN, remap_buffer=ht57_remap_buffer
+                )
+
+                if csi_data is None:
                     filtered_count += 1
-                    # Log warning every 100 filtered packets
                     if filtered_count % 100 == 1:
-                        print(f"[WARN] Filtered {filtered_count} packets with wrong SC count (got {len(frame[5])} bytes, expected {EXPECTED_CSI_LEN})")
+                        print(f"[WARN] Filtered {filtered_count} packets with wrong SC count (got {raw_len} bytes, expected {EXPECTED_CSI_LEN})")
                     del frame
                     continue
-                
-                # Extract data and free frame immediately to save memory
-                csi_data = frame[5][:EXPECTED_CSI_LEN]
+
+                if remap_tag in ('double_ht20', 'double_ht57_and_remap') and not collapse_logged:
+                    print("[INFO] CSI double-length collapse active: 256->128 and/or 228->114")
+                    collapse_logged = True
+                if remap_tag in ('ht57_to_64', 'double_ht57_and_remap') and not remap_logged:
+                    print("[INFO] CSI remap active: 57->64 SC (left_pad=4, right_pad=3)")
+                    remap_logged = True
                 packet_channel = frame[1]
-                
-                # Apply gain compensation if needed (gain lock skipped or disabled)
-                if g_state.needs_compensation:
-                    current_agc = frame[22]
-                    current_fft = to_signed_int8(frame[23])
-                    compensation = calculate_gain_compensation(
-                        g_state.baseline_agc, g_state.baseline_fft,
-                        current_agc, current_fft
-                    )
-                    detector.set_gain_compensation(compensation)
                 
                 del frame
                 
                 # Process packet through detector interface
                 detector.process_packet(csi_data, config.SELECTED_SUBCARRIERS)
+
+                # Poll MQTT commands every 10 packets to reduce hot-loop overhead
+                # without making command responsiveness noticeable to users.
+                mqtt_poll_counter += 1
+                if mqtt_poll_counter >= 10:
+                    mqtt_handler.check_messages()
+                    mqtt_poll_counter = 0
                 
                 publish_counter += 1
+                runtime_policy.note_packet()
+                should_publish = publish_counter >= publish_rate
                 
-                # Publish every N packets (where N = publish_rate)
-                if publish_counter >= publish_rate:
+                if runtime_policy.should_evaluate(should_publish):
                     # Detect WiFi channel changes (AP may switch channels automatically)
                     # Channel changes cause CSI spikes that trigger false motion detection
                     if g_state.current_channel != 0 and packet_channel != g_state.current_channel:
                         print(f"[WARN] WiFi channel changed: {g_state.current_channel} -> {packet_channel}, resetting detection buffer")
                         detector.reset()
+                        runtime_policy.reset()
                     g_state.current_channel = packet_channel
                     
-                    # Update state (lazy evaluation)
                     metrics = detector.update_state()
-                    current_time = time.ticks_ms()
-                    time_delta = time.ticks_diff(current_time, last_publish_time)
-                    
-                    # Calculate packets per second
-                    pps = int((publish_counter * 1000) / time_delta) if time_delta > 0 else 0
-                    
-                    dropped = wlan.csi_dropped()
-                    dropped_delta = dropped - last_dropped
-                    last_dropped = dropped
-                    
-                    state_str = 'MOTION' if metrics['state'] == 1 else 'IDLE'
-                    motion_metric = metrics.get('moving_variance', metrics.get('jitter', metrics.get('probability', 0)))
-                    threshold = metrics['threshold']
-                    is_ml = 'probability' in metrics
-                    # For ML, probability and threshold are both 0-1, so progress = probability
-                    if is_ml:
-                        progress = motion_metric  # probability is already 0-1
-                    else:
-                        progress = motion_metric / threshold if threshold > 0 else 0
-                    progress_bar = format_progress_bar(progress, threshold, is_probability=is_ml)
-                    print(f"{progress_bar} | pkts:{publish_counter} drop:{dropped_delta} pps:{pps} | "
-                          f"mvmt:{motion_metric:.4f} thr:{threshold:.4f} | {state_str}")
-                    
-                    mqtt_handler.publish_state(
-                        motion_metric,
-                        metrics['state'],
-                        threshold,
-                        publish_counter,
-                        dropped_delta,
-                        pps
-                    )
-                    publish_counter = 0
-                    last_publish_time = current_time
+                    effective_state, _ = runtime_policy.apply_state(metrics['state'])
+                    runtime_policy.after_evaluation()
+
+                    if should_publish:
+                        current_time = time.ticks_ms()
+                        time_delta = time.ticks_diff(current_time, last_publish_time)
+                        
+                        # Calculate packets per second
+                        pps = int((publish_counter * 1000) / time_delta) if time_delta > 0 else 0
+                        
+                        dropped = wlan.csi_dropped()
+                        dropped_delta = dropped - last_dropped
+                        last_dropped = dropped
+                        
+                        state_str = 'MOTION' if effective_state == 1 else 'IDLE'
+                        motion_metric = metrics.get('moving_variance', metrics.get('jitter', metrics.get('probability', 0)))
+                        threshold = metrics['threshold']
+                        is_ml = 'probability' in metrics
+                        # For ML, motion_metric and threshold are both on the detector's 0-10 scale.
+                        if is_ml:
+                            progress = motion_metric
+                        else:
+                            progress = motion_metric / threshold if threshold > 0 else 0
+                        progress_bar = format_progress_bar(progress, threshold, is_probability=is_ml)
+                        print(f"{progress_bar} | pkts:{publish_counter} drop:{dropped_delta} pps:{pps} | "
+                              f"mvmt:{motion_metric:.4f} thr:{threshold:.4f} | {state_str}")
+                        
+                        mqtt_handler.publish_state(
+                            motion_metric,
+                            effective_state,
+                            threshold,
+                            publish_counter,
+                            dropped_delta,
+                            pps
+                        )
+                        publish_counter = 0
+                        last_publish_time = current_time
 
                 # Update loop time metric
                 g_state.loop_time_us = time.ticks_diff(time.ticks_us(), loop_start)

@@ -2,7 +2,7 @@
  * ESPectre - Calibration File Buffer
  * 
  * File-based buffer for calibration data storage on SPIFFS.
- * Shared between P95 and NBVI calibrators to avoid code duplication.
+ * Used by NBVI calibrator for file-based calibration data storage.
  * 
  * Stores CSI magnitude data as uint8 (max CSI magnitude ~181 fits in 1 byte).
  * Uses SPIFFS to avoid RAM limitations on ESP32.
@@ -13,6 +13,7 @@
 
 #pragma once
 
+#include "base_detector.h"  // For CALIBRATION_DEFAULT_BUFFER_SIZE
 #include "utils.h"
 #include <cstdint>
 #include <cstdio>
@@ -27,7 +28,7 @@ namespace espectre {
  * Manages file-based storage of CSI magnitude data during calibration.
  * Handles SPIFFS mounting, file I/O, progress tracking, and data retrieval.
  * 
- * Used by both P95Calibrator and NBVICalibrator via composition.
+ * Used by NBVICalibrator via composition.
  */
 class CalibrationFileBuffer {
  public:
@@ -37,7 +38,7 @@ class CalibrationFileBuffer {
    * @param buffer_path Path for the calibration data file
    * @param buffer_size Number of packets to collect
    */
-  void init(const char* buffer_path, uint16_t buffer_size = 700);
+  void init(const char* buffer_path, uint16_t buffer_size = CALIBRATION_DEFAULT_BUFFER_SIZE);
   
   /**
    * Reset buffer state for a new calibration cycle
@@ -104,7 +105,7 @@ class CalibrationFileBuffer {
   
   FILE* buffer_file_{nullptr};
   uint16_t buffer_count_{0};
-  uint16_t buffer_size_{700};
+  uint16_t buffer_size_{CALIBRATION_DEFAULT_BUFFER_SIZE};
   const char* buffer_path_{nullptr};
   uint8_t last_progress_{0};
 };

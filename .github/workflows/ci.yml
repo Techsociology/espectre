@@ -3,32 +3,8 @@ name: CI
 on:
   push:
     branches: [main, develop]
-    paths:
-      - 'components/espectre/**'
-      - 'micro-espectre/src/**'
-      - 'micro-espectre/tests/**'
-      - 'micro-espectre/requirements.txt'
-      - 'test/**'
-      - 'examples/*.yaml'
-      - '.github/workflows/**'
-      - '.github/scripts/**'
-      - '*.md'
-      - 'micro-espectre/*.md'
-      - 'docs/**'
   pull_request:
     branches: [develop]
-    paths:
-      - 'components/espectre/**'
-      - 'micro-espectre/src/**'
-      - 'micro-espectre/tests/**'
-      - 'micro-espectre/requirements.txt'
-      - 'test/**'
-      - 'examples/*.yaml'
-      - '.github/workflows/**'
-      - '.github/scripts/**'
-      - '*.md'
-      - 'micro-espectre/*.md'
-      - 'docs/**'
   workflow_dispatch:  # Manual trigger to warm up cache
 
 # Permissions for GitHub Pages deployment
@@ -43,8 +19,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  detect-push-origin:
+    name: Detect Push Origin
+    runs-on: ubuntu-latest
+    outputs:
+      run_ci: ${{ steps.detect.outputs.run_ci }}
+      is_pr_push: ${{ steps.detect.outputs.is_pr_push }}
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Detect if push commit belongs to merged PR
+        id: detect
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Default: run CI unless we prove this is a merged-PR push to develop.
+            if (context.eventName !== "push" || context.ref !== "refs/heads/develop") {
+              core.setOutput("run_ci", "true");
+              core.setOutput("is_pr_push", "false");
+              core.info("Not a push on develop. CI will run.");
+              return;
+            }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const sha = context.sha;
+
+            const response = await github.request("GET /repos/{owner}/{repo}/commits/{commit_sha}/pulls", {
+              owner,
+              repo,
+              commit_sha: sha,
+              mediaType: { previews: ["groot"] }
+            });
+
+            const relatedMergedPr = response.data.find((pr) =>
+              pr &&
+              pr.merged_at &&
+              pr.base &&
+              pr.base.ref === "develop"
+            );
+
+            const isPrPush = Boolean(relatedMergedPr);
+            core.setOutput("is_pr_push", isPrPush ? "true" : "false");
+            core.setOutput("run_ci", isPrPush ? "false" : "true");
+
+            if (isPrPush) {
+              core.info(`Detected merged PR push (PR #${relatedMergedPr.number}). Skipping duplicate CI on develop push.`);
+            } else {
+              core.info("No merged PR associated with this push commit. Treating as direct push; CI will run.");
+            }
+
   build-docs:
     name: Build Documentation
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     
     steps:
@@ -73,11 +102,11 @@ jobs:
       
       - name: Setup Pages
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
       
       - name: Upload Pages Artifact
         if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-        uses: actions/upload-pages-artifact@v4
+        uses: actions/upload-pages-artifact@v5
         with:
           path: docs
 
@@ -93,7 +122,7 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
 
   notify-indexnow:
     name: Notify IndexNow
@@ -118,6 +147,8 @@ jobs:
 
   test-cpp:
     name: C++ Unit Tests
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     
     steps:
@@ -147,7 +178,7 @@ jobs:
         run: ./run_coverage.sh --ci
       
       - name: Upload Coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: test/coverage.xml,test/coverage.lcov
           flags: cpp
@@ -158,6 +189,8 @@ jobs:
 
   test-python:
     name: Python Unit Tests (micro-espectre)
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     
     steps:
@@ -177,7 +210,7 @@ jobs:
           pytest tests/ -v --cov=src --cov-report=xml --cov-report=term-missing
       
       - name: Upload Coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v6
         with:
           files: micro-espectre/coverage.xml
           flags: python
@@ -189,6 +222,8 @@ jobs:
   # Pre-cache job: downloads toolchain once, shared by all build jobs
   setup-cache:
     name: Setup Build Cache
+    needs: detect-push-origin
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     runs-on: ubuntu-latest
     outputs:
       cache-hit: ${{ steps.cache.outputs.cache-hit }}
@@ -213,52 +248,59 @@ jobs:
           restore-keys: |
             pio-espidf-
       
-      - name: Install ESPHome and warm cache
-        if: steps.cache.outputs.cache-hit != 'true'
+      - name: Install ESPHome
         run: |
           python -m pip install --upgrade pip
           pip install esphome
-          # Warm up cache by compiling one config (downloads all shared dependencies)
-          esphome compile examples/espectre-c6.yaml
 
   build:
     name: ${{ matrix.qemu_chip && 'Smoke Test' || 'Build' }} ${{ matrix.chip }}
     runs-on: ubuntu-latest
-    needs: setup-cache
+    needs: [detect-push-origin, setup-cache]
+    if: needs.detect-push-origin.outputs.run_ci == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
           # Standard builds (no QEMU)
+          # config: production file (GitHub component), config_dev: local component
           - chip: ESP32
             config: examples/espectre-esp32.yaml
+            config_dev: examples/espectre-esp32-dev.yaml
           - chip: ESP32-S2
             config: examples/espectre-s2.yaml
+            config_dev: examples/espectre-s2-dev.yaml
           - chip: ESP32-S3
             config: examples/espectre-s3.yaml
+            config_dev: examples/espectre-s3-dev.yaml
           - chip: ESP32-C3
             config: examples/espectre-c3.yaml
+            config_dev: examples/espectre-c3-dev.yaml
           - chip: ESP32-C5
             config: examples/espectre-c5.yaml
+            config_dev: examples/espectre-c5-dev.yaml
           - chip: ESP32-C6
             config: examples/espectre-c6.yaml
-          # QEMU smoke tests (examples/uart/)
-          # Note: ESP32 original excluded - QEMU doesn't emulate PHY registers correctly
+            config_dev: examples/espectre-c6-dev.yaml
+          # QEMU smoke tests (.github/actions/qemu-smoke-test/configs/)
+          # Supported targets: ESP32, ESP32-S3, ESP32-C3 (official Espressif QEMU fork)
+          # WiFi PHY is not emulated by QEMU; the PHY assert is filtered in the CI action
+          # ESP32-C6 and newer chips are not supported by the Espressif QEMU fork
+          - chip: ESP32
+            config: .github/actions/qemu-smoke-test/configs/esp32.yaml
+            qemu_chip: esp32
+            qemu_arch: xtensa
+            qemu_machine: esp32
           - chip: ESP32-S3
-            config: examples/uart/espectre-s3.yaml
+            config: .github/actions/qemu-smoke-test/configs/esp32s3.yaml
             qemu_chip: esp32s3
             qemu_arch: xtensa
             qemu_machine: esp32s3
           - chip: ESP32-C3
-            config: examples/uart/espectre-c3.yaml
+            config: .github/actions/qemu-smoke-test/configs/esp32c3.yaml
             qemu_chip: esp32c3
             qemu_arch: riscv32
             qemu_machine: esp32c3
-          - chip: ESP32-C6
-            config: examples/uart/espectre-c6.yaml
-            qemu_chip: esp32c6
-            qemu_arch: riscv32
-            qemu_machine: esp32c6
     
     steps:
       - uses: actions/checkout@v6
@@ -284,8 +326,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install esphome
       
+      - name: Create secrets.yaml for dev configs
+        if: github.ref != 'refs/heads/main' && !matrix.qemu_chip
+        run: |
+          cat > examples/secrets.yaml << 'EOF'
+          wifi_ssid: CI_TEST
+          wifi_password: ci_password
+          EOF
+      
       - name: Compile
-        run: esphome compile ${{ matrix.config }}
+        run: |
+          # QEMU configs always use local component (no branch distinction)
+          # Standard configs use -dev (local component) on develop/PR, production on main
+          if [ -n "${{ matrix.qemu_chip }}" ]; then
+            esphome compile ${{ matrix.config }}
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            esphome compile ${{ matrix.config }}
+          else
+            esphome compile ${{ matrix.config_dev }}
+          fi
       
       # QEMU smoke test for UART builds
       - name: Run QEMU smoke test
@@ -298,7 +357,7 @@ jobs:
       
       - name: Upload QEMU logs
         if: matrix.qemu_chip && always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: qemu-logs-${{ matrix.qemu_machine }}
           path: qemu_output.log

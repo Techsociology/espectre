@@ -16,24 +16,13 @@ Author: Francesco Pace <francesco.pace@gmail.com>
 License: GPLv3
 """
 
-import sys
 import numpy as np
 import argparse
 import matplotlib.pyplot as plt
-from pathlib import Path
 
-# Add micro-espectre and src to path for imports
-_micro_espectre_path = str(Path(__file__).parent.parent)
-_src_path = str(Path(__file__).parent.parent / 'src')
-if _src_path not in sys.path:
-    sys.path.insert(0, _src_path)
-if _micro_espectre_path not in sys.path:
-    sys.path.insert(0, _micro_espectre_path)
-
-from csi_utils import load_baseline_and_movement, find_dataset, DEFAULT_SUBCARRIERS
-
-# Alias for backward compatibility
-SELECTED_SUBCARRIERS = DEFAULT_SUBCARRIERS
+# Import csi_utils first - it sets up paths automatically
+from csi_utils import load_baseline_and_movement, find_dataset
+from config import DEFAULT_SUBCARRIERS
 
 def extract_iq_data(packets, subcarriers, num_packets=50, offset=0):
     """
@@ -352,7 +341,7 @@ Examples:
     if args.subcarriers:
         subcarriers = [int(x.strip()) for x in args.subcarriers.split(',')]
     else:
-        subcarriers = SELECTED_SUBCARRIERS
+        subcarriers = DEFAULT_SUBCARRIERS
     
     print("")
     print("╔═══════════════════════════════════════════════════════╗")

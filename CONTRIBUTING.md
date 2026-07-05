@@ -83,8 +83,8 @@ cd test && pio test
 # Python tests (Micro-ESPectre)
 cd micro-espectre && pytest tests/ -v
 
-# With coverage
-pytest tests/ -v --cov=src --cov-report=term-missing
+# With coverage (run from micro-espectre/)
+cd micro-espectre && pytest tests/ -v --cov=src --cov-report=term-missing
 ```
 
 ---
@@ -139,6 +139,24 @@ feat: add low-pass filter for noise reduction
 fix: correct calibration for edge cases
 docs: update TUNING.md with filter examples
 test: add unit tests for Hampel filter
+```
+
+### DCO Sign-off (required)
+
+This repository enforces the Developer Certificate of Origin (DCO) in CI.
+Every commit in a pull request must include a valid `Signed-off-by` trailer.
+
+Use:
+
+```bash
+git commit -s -m "type: short description"
+```
+
+For existing commits, add the sign-off and force-push your branch:
+
+```bash
+git commit --amend -s
+git push --force-with-lease
 ```
 
 ### Code Style
@@ -323,11 +341,13 @@ All contributors are recognized in:
 
 ## License
 
-By contributing to ESPectre, you agree that your contributions will be licensed under the **GPLv3** license. This means:
+By contributing to ESPectre, you agree that your contributions are licensed
+under the **GPLv3** license.
 
-- Your code will remain free and open source
-- You retain copyright of your contributions
-- No CLA (Contributor License Agreement) is required
+All contributions must also be certified under the Developer Certificate of
+Origin (DCO) by adding the `Signed-off-by` trailer to each commit.
+This certifies that you have the right to submit the contribution under the
+project license.
 
 See [LICENSE](LICENSE) for details.
 

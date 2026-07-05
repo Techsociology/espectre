@@ -59,17 +59,16 @@ This fork makes CSI-based applications accessible to Python developers and enabl
 | **Motion Detection** |
 | MVS Detector | ✅ | ✅ | Moving Variance Segmentation (default) |
 | ML Detector | ✅ | ✅ | Neural Network (experimental) |
-| ML Features (12) | ✅ | ✅ | mean, std, max, min, zcr, skewness, kurtosis, entropy, autocorr, mad, slope, delta |
+| ML Features (9) | ✅ | ✅ | mean, std, max, min, iqr, skewness, autocorr, mad, waveform_length |
 | **Calibration (MVS only)** |
-| NBVI | ✅ | ✅ | 12 non-consecutive subcarriers (default) |
-| P95 | ✅ | ✅ | 12 consecutive subcarriers (alternative) |
-| Adaptive Threshold | ✅ | ✅ | P95 × 1.4 of baseline variance |
+| NBVI | ✅ | ✅ | 12 non-consecutive subcarriers |
+| Adaptive Threshold | ✅ | ✅ | P95 × 1.1 of baseline variance |
 | **Gain Lock** |
 | AGC/FFT Lock | ✅ | ✅ | Hardware gain stabilization (S3/C3/C5/C6) |
-| Gain Compensation | ✅ | ✅ | Amplitude normalization when lock skipped |
+| CV Normalization | ✅ | ✅ | Gain-invariant normalization when lock skipped |
 | **Filters** |
 | Low-Pass | ✅ | ✅ | Butterworth 1st order, 11 Hz cutoff (disabled by default) |
-| Hampel | ✅ | ✅ | MAD-based outlier removal (disabled by default) |
+| Hampel | ✅ | ✅ | MAD-based outlier removal (enabled by default) |
 | **Traffic Generator** |
 | DNS Method | ✅ | ✅ | UDP packets to gateway (default) |
 | Ping Method | ✅ | ❌ | ICMP packets (ESPHome only) |
@@ -132,6 +131,7 @@ The `me` CLI provides these essential commands:
 | `deploy` | Deploy Python code to device | `./me deploy` |
 | `run` | Run the application | `./me run` |
 | `stream` | Stream raw CSI data via UDP | `./me stream --ip 192.168.1.100` |
+| `detect` | Run live ML motion detection on the PC | `./me detect --log-turbulence` |
 | `collect` | Collect labeled CSI data for ML training | `./me collect --label baseline --duration 10` |
 | `verify` | Verify firmware installation | `./me verify` |
 | `ui` | Open web monitoring interface in browser | `./me ui` |
@@ -153,6 +153,9 @@ The `me` CLI provides these essential commands:
 
 # For real-time CSI streaming (gesture detection, research)
 ./me stream --ip 192.168.1.100  # Stream to PC
+
+# On the PC, inspect live ML motion inference
+./me detect --log-turbulence
 ```
 
 > **Note**: The interactive mode (`./me` without arguments) provides advanced MQTT control features and is covered in detail in the [Interactive CLI (Advanced)](#interactive-cli-advanced) section.
@@ -170,13 +173,27 @@ If you've already set up the main ESPectre project, you can reuse that virtual e
 git clone https://github.com/francescopace/espectre.git
 cd espectre/micro-espectre
 
+# Verify Python version (3.12 required)
+python3 --version  # Should show Python 3.12.x
+
 # Create and activate virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On macOS/Linux
-# venv\Scripts\activate   # On Windows
+python3.12 -m venv venv      # macOS/Linux — use python3 if pyenv auto-selected 3.12
+source venv/bin/activate     # On macOS/Linux
+# venv\Scripts\activate      # On Windows
 
 # Your prompt should now show (venv) prefix
 ```
+
+> **Tip — Python 3.12 not found?**
+>
+> **macOS (Homebrew):** `brew install python@3.12`
+>
+> **pyenv (any OS):**
+> ```bash
+> pyenv install 3.12
+> # The .python-version file in this directory selects it automatically
+> ```
+> After installing, re-run `python3.12 -m venv venv`.
 
 **Why use a virtual environment?**
 - Isolates project dependencies from system Python
@@ -256,7 +273,7 @@ That's it! The device will now:
 - Connect to WiFi
 - Connect to MQTT broker
 - Start publishing motion detection data
-- Automatically calibrate subcarriers (NBVI or P95 algorithm)
+- Automatically calibrate subcarriers (NBVI algorithm)
 
 ### 5. Monitor and Control
 
@@ -337,10 +354,12 @@ pytest tests/test_segmentation.py::TestStateMachine -v
 |-------|------|------|-------|
 | `test_config` | Unit | — | Configuration constants, guard bands |
 | `test_filters` | Unit | Synthetic | Hampel, low-pass filters |
-| `test_features` | Unit | Synthetic | Feature extraction (entropy, skewness, kurtosis) |
+| `test_features` | Unit | Synthetic | Production ML feature extraction (9 inputs) |
 | `test_segmentation` | Unit | Synthetic | MVS state machine, variance calculation |
-| `test_p95_calibrator` | Unit | **Real** | P95 band selection, magnitude, turbulence |
+| `test_segmentation_additional` | Unit | Synthetic | Additional segmentation edge cases |
 | `test_nbvi_calibrator` | Unit | **Real** | NBVI subcarrier selection |
+| `test_ml_detector` | Unit | **Real** | ML detector, features, inference |
+| `test_ml_inference` | Unit | **Real** | ML inference matches C++ reference |
 | `test_mqtt` | Unit | Synthetic | MQTT handler and commands |
 | `test_traffic_generator` | Unit | Synthetic | Rate limiting, error handling |
 | `test_running_variance` | Unit | Synthetic | O(1) vs two-pass variance comparison |
@@ -370,9 +389,9 @@ GAIN_LOCK_MIN_SAFE_AGC = 30   # Minimum safe AGC (used in auto mode)
 
 | Mode | Description |
 |------|-------------|
-| `auto` (default) | Lock gain, skip if signal too strong (AGC < 30). Uses gain compensation when skipped. |
+| `auto` (default) | Lock gain, skip if signal too strong (AGC < 30). Uses CV normalization when skipped. |
 | `enabled` | Always force gain lock (may freeze if too close to AP) |
-| `disabled` | Never lock gain. Uses gain compensation to normalize amplitudes. |
+| `disabled` | Never lock gain. Uses CV normalization for stable detection. |
 
 ### 2. Detection Algorithm
 
@@ -384,28 +403,37 @@ DETECTION_ALGORITHM = "mvs"   # "mvs" (default) or "ml"
 
 | Algorithm | Method | Calibration | Boot Time |
 |-----------|--------|-------------|-----------|
-| **MVS** (default) | Moving Variance Segmentation of Turbulence | Subcarriers + Threshold | ~10s |
-| **ML** | Neural Network (12 features → MLP) | **None** (fixed subcarriers) | **~3s** |
+| **MVS** (default) | Moving Variance Segmentation of Turbulence | Subcarriers + Threshold | ~13s |
+| **ML** | Neural Network (9 features → MLP) | **None** (fixed subcarriers) | **~3s** |
 
 ### 3. Calibration Algorithm (MVS only)
 
 Selects which subcarriers to use for detection.
 
 ```python
-CALIBRATION_ALGORITHM = "nbvi"  # "nbvi" (default) or "p95"
+CALIBRATION_ALGORITHM = "nbvi"  # NBVI is the sole calibration algorithm
 ```
 
 | Algorithm | Selection | Best For |
 |-----------|-----------|----------|
-| **NBVI** (default) | 12 non-consecutive subcarriers | Spectral diversity, ~3x faster |
-| **P95** | 12 consecutive subcarriers | Simpler logic, contiguous bands |
+| **NBVI** | 12 non-consecutive subcarriers | Spectral diversity, resilient to interference |
 
 ### 4. Detection Parameters (MVS only)
 
 ```python
-SEG_THRESHOLD = "auto"     # "auto" (P95×1.4), "min" (P100), or 0.1-10.0
-SEG_WINDOW_SIZE = 50       # Moving variance window (10-200 packets)
+SEG_THRESHOLD = "auto"     # "auto" (adaptive), "min" (max baseline), or 0.0-10.0
+SEG_WINDOW_SIZE = 100      # Moving variance window (10-200 packets)
+PUBLISH_INTERVAL = 100     # Periodic MQTT/log publish cadence
+EVALUATION_INTERVAL = 25   # Detector evaluation cadence (independent from publish)
+MOTION_ON_HITS = 3         # Consecutive evaluated MOTION hits required to enter MOTION
+MOTION_OFF_HITS = 3        # Consecutive evaluated IDLE hits required to return to IDLE
 ```
+
+`SEG_WINDOW_SIZE` still defines the analysis window, while `EVALUATION_INTERVAL`
+controls how often the detector state machine is evaluated during runtime. The
+published MQTT payload remains periodic (`PUBLISH_INTERVAL`), but the reported
+`state` now reflects the filtered runtime state after the `MOTION_ON_HITS` /
+`MOTION_OFF_HITS` debounce logic has been applied.
 
 ### 5. Filters (Optional, MVS and ML)
 
@@ -417,9 +445,9 @@ ENABLE_LOWPASS_FILTER = False
 LOWPASS_CUTOFF = 11.0          # Cutoff frequency in Hz
 
 # Hampel filter (outlier/spike removal)
-ENABLE_HAMPEL_FILTER = False
+ENABLE_HAMPEL_FILTER = True
 HAMPEL_WINDOW = 7
-HAMPEL_THRESHOLD = 4.0
+HAMPEL_THRESHOLD = 5.0
 ```
 
 For detailed parameter tuning, see [TUNING.md](../TUNING.md).
@@ -440,6 +468,11 @@ The system publishes JSON payloads to the configured MQTT topic (default: `home/
 }
 ```
 
+The payload is emitted every `PUBLISH_INTERVAL` packets. Its `state` field is
+not the raw detector output of a single evaluation: it is the effective runtime
+state after evaluation every `EVALUATION_INTERVAL` packets and after the
+`MOTION_ON_HITS` / `MOTION_OFF_HITS` consecutive-hit filter.
+
 ## Analysis Tools
 
 The `tools/` directory contains Python scripts for CSI data analysis and algorithm validation.
@@ -448,18 +481,17 @@ See [tools/README.md](tools/README.md) for complete script documentation.
 
 ## Automatic Subcarrier Selection
 
-Micro-ESPectre implements automatic subcarrier selection with two algorithms:
+Micro-ESPectre implements automatic subcarrier selection using the **NBVI** (Normalized Band Variance Index) algorithm:
 
-- **NBVI** (default): Selects 12 non-consecutive subcarriers based on baseline variability index
-- **P95**: Selects 12 consecutive subcarriers by minimizing P95 moving variance
+- **NBVI**: Selects 12 non-consecutive subcarriers based on baseline variability index
 
 Both algorithms achieve high performance (>90% recall, <15% FP rate) with **zero manual configuration**.
 
 > ⚠️ **IMPORTANT**: Keep the room **quiet and still** after device boot during calibration:
-> - **MVS**: ~10 seconds (gain lock + band calibration)
+> - **MVS**: ~13 seconds (gain lock + band calibration)
 > - **ML**: ~3 seconds (gain lock only, no band calibration needed)
 
-For complete algorithm documentation, see [ALGORITHMS.md](ALGORITHMS.md#automatic-subcarrier-selection).
+For complete algorithm documentation, see [ALGORITHMS.md](ALGORITHMS.md#subcarrier-selection-nbvi).
 
 ## Machine Learning
 
@@ -467,12 +499,12 @@ Micro-ESPectre includes a **neural network-based motion detector** as an experim
 
 ### ML Detector (Experimental)
 
-The ML detector (`DETECTION_ALGORITHM = "ml"`) is a compact MLP trained on real CSI data. It extracts 12 statistical features from turbulence patterns and outputs a motion probability.
+The ML detector (`DETECTION_ALGORITHM = "ml"`) is a compact MLP trained on real CSI data. It extracts 9 turbulence-window features, including robust spread statistics such as `turb_iqr` and `turb_mad`, and outputs a motion probability.
 
 | Aspect | Details |
 |--------|---------|
-| Architecture | MLP (12 → 16 → 8 → 1) |
-| Input | 12 features from 50-packet window |
+| Architecture | MLP (9 → 24 → 12 → 1) |
+| Input | 9 features from 100-packet window |
 | Output | Probability (0.0 - 1.0), threshold at 0.5 |
 | Filters | Supports low-pass and Hampel filters (same as MVS) |
 | Performance | See [PERFORMANCE.md](../PERFORMANCE.md) for per-chip results |
@@ -552,7 +584,7 @@ Beyond the basic commands covered in the [CLI Tool Overview](#cli-tool-overview)
 ./me
 
 # Connect to specific broker
-./me --broker 192.168.1.100 --port 1883
+./me --broker 192.168.1.100 --port-mqtt 1883
 
 # With authentication
 ./me --broker homeassistant.local --username mqtt --password mqtt
@@ -679,6 +711,7 @@ Publish JSON commands to `home/espectre/node1/cmd`:
     "ip_address": "192.168.1.28",
     "mac_address": "7C:2C:67:42:BB:AC",
     "channel": {"primary": 4, "secondary": 0},
+    "band_mode": "2g-only",
     "protocol": "802.11b/g/n/ax",
     "bandwidth": "HT20",
     "csi_enabled": true,
@@ -690,7 +723,16 @@ Publish JSON commands to `home/espectre/node1/cmd`:
     "cmd_topic": "home/espectre/node1/cmd",
     "response_topic": "home/espectre/node1/response"
   },
-  "segmentation": {"threshold": 1.0, "window_size": 50},
+  "detection": {
+    "algorithm": "MVS",
+    "calibrator": "nbvi",
+    "threshold": 1.0,
+    "window_size": 100,
+    "publish_interval": 100,
+    "evaluation_interval": 25,
+    "motion_on_hits": 3,
+    "motion_off_hits": 3
+  },
   "subcarriers": {"indices": [6, 9, 10, 15, 18, 19, 30, 33, 36, 40, 49, 52]}
 }
 ```
@@ -729,7 +771,7 @@ Publish JSON commands to `home/espectre/node1/cmd`:
 
 ### Runtime Configuration
 
-Configuration changes made via MQTT commands are **session-only** and reset on reboot. The adaptive threshold (P95 × 1.4) is recalculated automatically at each boot for optimal performance.
+Configuration changes made via MQTT commands are **session-only** and reset on reboot. The adaptive threshold is recalculated automatically at each boot for optimal performance.
 
 ## Home Assistant Integration
 

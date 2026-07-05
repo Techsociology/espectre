@@ -28,7 +28,7 @@ _original_buffer_file = nbvi_calibrator.BUFFER_FILE
 _temp_dir = tempfile.gettempdir()
 nbvi_calibrator.BUFFER_FILE = os.path.join(_temp_dir, 'nbvi_buffer_test.bin')
 
-from nbvi_calibrator import NBVICalibrator
+from nbvi_calibrator import NBVICalibrator, NUM_SUBCARRIERS
 
 
 @pytest.fixture(autouse=True)
@@ -38,13 +38,13 @@ def cleanup_buffer_file():
     if os.path.exists(test_file):
         try:
             os.remove(test_file)
-        except:
+        except Exception:
             pass
     yield
     if os.path.exists(test_file):
         try:
             os.remove(test_file)
-        except:
+        except Exception:
             pass
 
 
@@ -61,7 +61,7 @@ class TestNBVICalibrator:
         
         assert calibrator.buffer_size == 500
         assert calibrator.percentile == 10
-        assert calibrator.alpha == 0.5
+        assert calibrator.alpha == 0.75
         assert calibrator.min_spacing == 1
         assert calibrator._packet_count == 0
         
@@ -136,56 +136,77 @@ class TestNBVICalibrator:
 class TestNBVICalculation:
     """Test NBVI calculation methods"""
     
-    def test_calculate_nbvi_weighted(self):
-        """Test NBVI weighted calculation"""
+    def test_calculate_nbvi_from_stats(self):
+        """Test NBVI calculation from pre-computed mean and std"""
         calibrator = NBVICalibrator()
         
-        # Test with known values
+        # mean=30.0, std from [30, 32, 28, 31, 29] = sqrt(2.0) ≈ 1.4142
+        import math
         magnitudes = [30.0, 32.0, 28.0, 31.0, 29.0]
+        mean = sum(magnitudes) / len(magnitudes)
+        variance = sum((m - mean) ** 2 for m in magnitudes) / len(magnitudes)
+        std = math.sqrt(variance)
         
-        result = calibrator._calculate_nbvi_weighted(magnitudes)
+        result = calibrator._calculate_nbvi_from_stats(mean, std)
         
-        assert 'nbvi' in result
+        assert 'nbvi_classic' in result
         assert 'mean' in result
         assert 'std' in result
         assert result['mean'] == pytest.approx(30.0, rel=1e-6)
-        assert result['nbvi'] > 0
-        
-        calibrator.free_buffer()
-    
-    def test_nbvi_empty_list(self):
-        """Test NBVI with empty list returns inf"""
-        calibrator = NBVICalibrator()
-        result = calibrator._calculate_nbvi_weighted([])
-        
-        assert result['nbvi'] == float('inf')
+        assert result['nbvi_classic'] > 0
         
         calibrator.free_buffer()
     
     def test_nbvi_zero_mean(self):
         """Test NBVI with zero mean returns inf"""
         calibrator = NBVICalibrator()
-        result = calibrator._calculate_nbvi_weighted([0.0, 0.0, 0.0])
-        
-        assert result['nbvi'] == float('inf')
-        
+        result = calibrator._calculate_nbvi_from_stats(0.0, 0.0)
+
+        assert result['nbvi_classic'] == float('inf')
+        assert result['nbvi_entropy'] == float('inf')
+        assert result['nbvi_mad'] == float('inf')
+
         calibrator.free_buffer()
     
     def test_nbvi_lower_is_better(self):
         """Test that stable signal has lower NBVI than noisy signal"""
         calibrator = NBVICalibrator()
-        
+
+        import math
         # Stable signal (low std)
         stable = [50.0, 50.5, 49.5, 50.2, 49.8]
-        result_stable = calibrator._calculate_nbvi_weighted(stable)
-        
+        mean_s = sum(stable) / len(stable)
+        std_s = math.sqrt(sum((m - mean_s) ** 2 for m in stable) / len(stable))
+        result_stable = calibrator._calculate_nbvi_from_stats(mean_s, std_s)
+
         # Noisy signal (high std)
         noisy = [50.0, 60.0, 40.0, 55.0, 45.0]
-        result_noisy = calibrator._calculate_nbvi_weighted(noisy)
-        
+        mean_n = sum(noisy) / len(noisy)
+        std_n = math.sqrt(sum((m - mean_n) ** 2 for m in noisy) / len(noisy))
+        result_noisy = calibrator._calculate_nbvi_from_stats(mean_n, std_n)
+
         # Lower NBVI = better subcarrier
-        assert result_stable['nbvi'] < result_noisy['nbvi']
-        
+        assert result_stable['nbvi_classic'] < result_noisy['nbvi_classic']
+
+        calibrator.free_buffer()
+
+    def test_nbvi_entropy_rewards_informative_distribution(self):
+        """Test that entropy score rewards subcarriers with higher entropy"""
+        calibrator = NBVICalibrator()
+
+        import math
+        vals = [50.0, 51.0, 50.5, 49.5, 50.2]
+        mean = sum(vals) / len(vals)
+        std = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
+
+        # High entropy → lower score (informative subcarrier preferred)
+        result_high = calibrator._calculate_nbvi_from_stats(mean, std, entropy=3.0)
+        # Low entropy → higher score (flat distribution penalized)
+        result_low = calibrator._calculate_nbvi_from_stats(mean, std, entropy=0.1)
+
+        assert 'nbvi_entropy' in result_high
+        assert result_high['nbvi_entropy'] < result_low['nbvi_entropy']
+
         calibrator.free_buffer()
 
 
@@ -437,23 +458,22 @@ class TestPacketReading:
         
         calibrator.free_buffer()
     
-    def test_read_window(self):
-        """Test reading a window of packets"""
+    def test_packet_turbulence(self):
+        """Test turbulence calculation from raw packet bytes"""
         calibrator = NBVICalibrator(buffer_size=20)
         
-        # Add packets
-        for i in range(20):
-            csi_data = bytes([30 + i % 10, 10] * 64)
-            calibrator.add_packet(csi_data)
+        # Add a packet with known values
+        csi_data = bytes([30, 10] * 64)
+        calibrator.add_packet(csi_data)
         
-        # Prepare for reading
         calibrator._prepare_for_reading()
         
-        # Read window
-        window = calibrator._read_window(0, 10)
+        data = calibrator._file.read(NUM_SUBCARRIERS)
+        band = list(range(11, 23))
+        turb = calibrator._packet_turbulence(data, band)
         
-        assert len(window) == 10
-        assert len(window[0]) == 64
+        # All magnitudes in band are identical → turbulence = 0
+        assert turb == 0.0
         
         calibrator.free_buffer()
 

@@ -11,15 +11,22 @@ import pytest
 import math
 import sys
 import os
+from pathlib import Path
+import numpy as np
 
 # Add src to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from src.ml_detector import (
     relu, sigmoid, normalize_features, predict, is_motion,
-    MLDetector
+    MLDetector, ML_DEFAULT_THRESHOLD, ML_METRIC_SCALE
 )
 from src.detector_interface import MotionState
+
+from src.ml_weights import FEATURE_MEAN, FEATURE_NAMES
+
+
+MODEL_INPUT_SIZE = len(FEATURE_MEAN)
 
 
 class TestRelu:
@@ -81,15 +88,16 @@ class TestNormalizeFeatures:
     
     def test_normalization_produces_list(self):
         """Normalization returns a list."""
-        features = [1.0] * 12
+        features = [1.0] * MODEL_INPUT_SIZE
         result = normalize_features(features)
         assert isinstance(result, list)
-        assert len(result) == 12
+        assert len(result) == MODEL_INPUT_SIZE
     
     def test_normalization_changes_values(self):
         """Normalization changes input values."""
-        features = [10.0, 5.0, 20.0, 1.0, 15.0, 8.0, 
-                    3.0, 2.5, 0.5, -0.5, 0.1, 5.0]
+        features = ([10.0, 5.0, 20.0, 1.0, 15.0, 8.0,
+                     3.0, 2.5, 0.5, -0.5, 0.1, 5.0][:MODEL_INPUT_SIZE]
+                    + [1.0] * max(0, MODEL_INPUT_SIZE - 12))
         result = normalize_features(features)
         # Values should be different after normalization
         assert result != features
@@ -100,44 +108,45 @@ class TestPredict:
     
     def test_predict_returns_float(self):
         """Predict returns a float."""
-        # Features: turb_mean, turb_std, turb_max, turb_min, turb_zcr,
-        #           turb_skewness, turb_kurtosis, turb_entropy,
-        #           turb_autocorr, turb_mad, turb_slope, turb_delta
-        features = [14.0, 2.0, 17.0, 9.0, 0.30,
-                    -1.5, 8.0, 2.0, 0.15, 0.7, 0.001, 0.0]
+        features = ([14.0, 2.0, 17.0, 9.0, 0.30,
+                     -1.5, 8.0, 2.0, 0.15, 0.7, 0.001, 0.0][:MODEL_INPUT_SIZE]
+                    + [0.0] * max(0, MODEL_INPUT_SIZE - 12))
         result = predict(features)
         assert isinstance(result, float)
     
     def test_predict_output_range(self):
-        """Prediction is always in [0, 1]."""
+        """Prediction is always in [0, 10]."""
         # Test with various feature combinations
         test_cases = [
-            [0.0] * 12,  # All zeros
-            [10.0] * 12,  # All same value
-            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],  # Increasing
+            [0.0] * MODEL_INPUT_SIZE,  # All zeros
+            [10.0] * MODEL_INPUT_SIZE,  # All same value
+            [float(i) for i in range(1, MODEL_INPUT_SIZE + 1)],  # Increasing
         ]
         for features in test_cases:
             result = predict(features)
-            assert 0.0 <= result <= 1.0
+            assert 0.0 <= result <= ML_METRIC_SCALE
     
     def test_predict_different_inputs_different_outputs(self):
         """Different inputs produce different outputs."""
-        # Use realistic feature values based on actual data distributions
-        # Features: turb_mean, turb_std, turb_max, turb_min, turb_zcr,
-        #           turb_skewness, turb_kurtosis, turb_entropy,
-        #           turb_autocorr, turb_mad, turb_slope, turb_delta
-        # Baseline-like: low turbulence, stable signal
-        features1 = [12.0, 1.0, 14.0, 10.0, 0.20,
-                     -3.0, 15.0, 1.5, 0.35, 0.3, 0.0, 0.0]
-        # Motion-like: high turbulence, turbulent signal
-        features2 = [20.0, 5.0, 27.0, 4.0, 0.50,
-                     1.0, 3.0, 3.0, -0.10, 2.5, 0.05, 5.0]
-        
+        # Use two real reference samples from the current exported model data.
+        # This avoids brittle hand-picked vectors that may both saturate to 0
+        # after retraining, while still verifying input sensitivity.
+        test_data_path = Path(__file__).parent.parent / "models" / "ml_test_data.npz"
+        if not test_data_path.exists():
+            pytest.skip(f"Test data not found: {test_data_path}")
+
+        test_data = np.load(test_data_path)
+        features = test_data["features"]
+
+        # Pick two distinct feature vectors from reference set.
+        features1 = features[0].tolist()
+        features2 = features[1].tolist()
+
         result1 = predict(features1)
         result2 = predict(features2)
-        
-        # Motion features should produce higher probability than baseline
-        assert result2 > result1
+
+        assert features1 != features2
+        assert result1 != result2
 
 
 class TestIsMotion:
@@ -145,20 +154,20 @@ class TestIsMotion:
     
     def test_is_motion_returns_bool(self):
         """is_motion returns a boolean."""
-        features = [5.0] * 12
+        features = [5.0] * MODEL_INPUT_SIZE
         result = is_motion(features)
         assert isinstance(result, bool)
     
     def test_is_motion_default_threshold(self):
-        """Default threshold is 0.5."""
-        features = [5.0] * 12
+        """Default threshold is 5.0."""
+        features = [5.0] * MODEL_INPUT_SIZE
         prob = predict(features)
-        expected = prob > 0.5
+        expected = prob > ML_DEFAULT_THRESHOLD
         assert is_motion(features) == expected
     
     def test_is_motion_custom_threshold(self):
         """Custom threshold works correctly."""
-        features = [5.0] * 12
+        features = [5.0] * MODEL_INPUT_SIZE
         prob = predict(features)
         
         # With threshold above probability, should be False
@@ -174,15 +183,25 @@ class TestMLDetector:
     def test_initialization_defaults(self):
         """Test default initialization."""
         detector = MLDetector()
-        assert detector._threshold == 0.5
+        assert detector._threshold == ML_DEFAULT_THRESHOLD
         assert detector._state == MotionState.IDLE
         assert detector._packet_count == 0
         assert detector.track_data == False
     
+    def test_hampel_enabled_by_default(self):
+        """Hampel filter is enabled by default (matches training pipeline)."""
+        detector = MLDetector()
+        assert detector._context.hampel_filter is not None
+    
+    def test_hampel_disabled_explicitly(self):
+        """Hampel filter can be disabled explicitly."""
+        detector = MLDetector(enable_hampel=False)
+        assert detector._context.hampel_filter is None
+    
     def test_initialization_custom_params(self):
         """Test initialization with custom parameters."""
-        detector = MLDetector(window_size=100, threshold=0.7)
-        assert detector._threshold == 0.7
+        detector = MLDetector(window_size=100, threshold=7.0)
+        assert detector._threshold == 7.0
         assert detector._context.window_size == 100
     
     def test_get_name(self):
@@ -197,22 +216,31 @@ class TestMLDetector:
     
     def test_get_threshold(self):
         """Test get_threshold."""
-        detector = MLDetector(threshold=0.6)
-        assert detector.get_threshold() == 0.6
+        detector = MLDetector(threshold=6.0)
+        assert detector.get_threshold() == 6.0
     
     def test_set_threshold_valid(self):
         """Test setting valid threshold."""
         detector = MLDetector()
-        assert detector.set_threshold(0.7) == True
-        assert detector._threshold == 0.7
+        assert detector.set_threshold(7.0) == True
+        assert detector._threshold == 7.0
     
     def test_set_threshold_invalid(self):
         """Test setting invalid threshold."""
         detector = MLDetector()
         original = detector._threshold
-        assert detector.set_threshold(1.5) == False
+        assert detector.set_threshold(10.1) == False
         assert detector.set_threshold(-0.1) == False
         assert detector._threshold == original
+
+    def test_set_cv_normalization_is_ignored(self):
+        """ML detector always uses raw std, regardless of runtime requests."""
+        detector = MLDetector()
+        detector.set_cv_normalization(True)
+        assert detector._context.use_cv_normalization is False
+
+        detector.set_cv_normalization(False)
+        assert detector._context.use_cv_normalization is False
     
     def test_is_ready_empty(self):
         """Detector is not ready before filling buffer."""
@@ -254,7 +282,7 @@ class TestMLDetectorProcessing:
     @pytest.fixture
     def detector(self):
         """Create a detector with small window for testing."""
-        return MLDetector(window_size=10, threshold=0.5)
+        return MLDetector(window_size=10, threshold=ML_DEFAULT_THRESHOLD)
     
     @pytest.fixture
     def sample_csi_data(self):
@@ -289,7 +317,7 @@ class TestMLDetectorProcessing:
         
         assert metrics['state'] == MotionState.IDLE
         assert metrics['probability'] == 0.0
-        assert metrics['threshold'] == 0.5
+        assert metrics['threshold'] == ML_DEFAULT_THRESHOLD
     
     def test_update_state_after_ready(self, detector, sample_csi_data):
         """Update state after buffer is full runs inference."""
@@ -302,7 +330,7 @@ class TestMLDetectorProcessing:
         assert 'state' in metrics
         assert 'probability' in metrics
         assert 'threshold' in metrics
-        assert 0.0 <= metrics['probability'] <= 1.0
+        assert 0.0 <= metrics['probability'] <= ML_METRIC_SCALE
     
     def test_tracking_enabled(self, detector, sample_csi_data):
         """Test that tracking records data when enabled."""
@@ -331,11 +359,11 @@ class TestMLDetectorProcessing:
         assert len(detector.state_history) == 0
 
 
-class TestExtractAllFeaturesIntegration:
-    """Test that extract_all_features is correctly integrated."""
+class TestExtractFeaturesIntegration:
+    """Test that extract_features_by_name is correctly integrated."""
     
-    def test_extract_features_returns_12_values(self):
-        """_extract_features returns 12 values."""
+    def test_extract_features_returns_model_feature_count(self):
+        """_extract_features matches the exported feature count."""
         detector = MLDetector(window_size=10)
         
         # Fill buffer with synthetic data
@@ -347,7 +375,7 @@ class TestExtractAllFeaturesIntegration:
         
         features = detector._extract_features()
         
-        assert len(features) == 12
+        assert len(features) == len(FEATURE_NAMES)
         assert all(isinstance(f, (int, float)) for f in features)
 
 

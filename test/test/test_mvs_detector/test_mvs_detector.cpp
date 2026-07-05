@@ -12,6 +12,7 @@
 #include <cstring>
 #include <cmath>
 #include "mvs_detector.h"
+#include "utils.h"
 #include "esphome/core/log.h"
 
 // Include CSI data loader
@@ -26,7 +27,7 @@ using namespace esphome::espectre;
 
 static const char *TAG = "test_mvs_detector";
 
-static const uint8_t TEST_SUBCARRIERS[12] = {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22};
+static const uint8_t* const TEST_SUBCARRIERS = DEFAULT_SUBCARRIERS;
 
 void setUp(void) {}
 void tearDown(void) {}
@@ -86,7 +87,8 @@ void test_mvs_detector_set_threshold_below_min(void) {
     MVSDetector detector;
     float original = detector.get_threshold();
     
-    TEST_ASSERT_FALSE(detector.set_threshold(0.01f));
+    // Min threshold is 0.0
+    TEST_ASSERT_FALSE(detector.set_threshold(-0.1f));
     TEST_ASSERT_EQUAL_FLOAT(original, detector.get_threshold());
 }
 
@@ -338,7 +340,7 @@ void test_mvs_detector_movement_detects_motion(void) {
         return;
     }
     
-    MVSDetector detector(50, 0.5f);  // Lower threshold for detection
+    MVSDetector detector(50, 0.0001f);  // Low threshold for CV-normalized detection
     detector.configure_lowpass(false);
     
     // First process baseline to fill buffer

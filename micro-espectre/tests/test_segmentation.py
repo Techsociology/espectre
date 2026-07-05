@@ -10,6 +10,7 @@ License: GPLv3
 import pytest
 import math
 import numpy as np
+from config import SEG_WINDOW_SIZE
 from segmentation import SegmentationContext
 
 
@@ -17,9 +18,9 @@ class TestSegmentationContextInit:
     """Test SegmentationContext initialization"""
     
     def test_default_parameters(self):
-        """Test default parameters"""
+        """Test default parameters (matches C++ DETECTOR_DEFAULT_WINDOW_SIZE)"""
         ctx = SegmentationContext()
-        assert ctx.window_size == 50
+        assert ctx.window_size == SEG_WINDOW_SIZE
         assert ctx.threshold == 1.0
         assert ctx.state == SegmentationContext.STATE_IDLE
         assert ctx.buffer_count == 0
@@ -36,13 +37,13 @@ class TestSegmentationContextInit:
     
     def test_buffer_pre_allocation(self):
         """Test that turbulence buffer is pre-allocated"""
-        ctx = SegmentationContext(window_size=75)
-        assert len(ctx.turbulence_buffer) == 75
+        ctx = SegmentationContext(window_size=SEG_WINDOW_SIZE)
+        assert len(ctx.turbulence_buffer) == SEG_WINDOW_SIZE
     
-    def test_hampel_disabled_by_default(self):
-        """Test that Hampel filter is disabled by default"""
+    def test_hampel_enabled_by_default(self):
+        """Test that Hampel filter is enabled by default"""
         ctx = SegmentationContext()
-        assert ctx.hampel_filter is None
+        assert ctx.hampel_filter is not None
     
     def test_hampel_enabled(self):
         """Test Hampel filter initialization when enabled"""
@@ -327,14 +328,18 @@ class TestAdaptiveThreshold:
         assert ctx.threshold == 2.0
     
     def test_adaptive_threshold_clamping(self):
-        """Test that adaptive threshold is clamped"""
+        """Test that adaptive threshold is clamped to [1e-6, 10.0]"""
         ctx = SegmentationContext()
         
-        ctx.set_adaptive_threshold(0.01)  # Too low
-        assert ctx.threshold == 0.1
+        ctx.set_adaptive_threshold(1e-8)  # Too low
+        assert ctx.threshold == pytest.approx(1e-6)
         
         ctx.set_adaptive_threshold(100.0)  # Too high
         assert ctx.threshold == 10.0
+        
+        # Values within range should pass through
+        ctx.set_adaptive_threshold(0.01)
+        assert ctx.threshold == pytest.approx(0.01)
     
     def test_no_normalization_applied(self):
         """Test that turbulence is NOT normalized (adaptive threshold approach)"""
@@ -437,13 +442,16 @@ class TestCalculateSpatialTurbulence:
     """Test the instance method calculate_spatial_turbulence"""
     
     def test_stores_amplitudes(self, synthetic_csi_packet, default_subcarriers):
-        """Test that amplitudes are stored for feature calculation"""
+        """Test that amplitudes are available when explicitly requested"""
         ctx = SegmentationContext()
         
-        turb = ctx.calculate_spatial_turbulence(synthetic_csi_packet, default_subcarriers)
+        turb, amps = ctx.calculate_spatial_turbulence(
+            synthetic_csi_packet, default_subcarriers, return_amplitudes=True
+        )
         
-        assert ctx.last_amplitudes is not None
-        assert len(ctx.last_amplitudes) == len(default_subcarriers)
+        assert len(amps) == len(default_subcarriers)
+        assert ctx._amplitude_count == len(default_subcarriers)
+        assert turb >= 0.0
 
 
 class TestEndToEnd:
@@ -467,7 +475,8 @@ class TestEndToEnd:
     
     def test_movement_detection(self, synthetic_csi_movement_packets, default_subcarriers):
         """Test that movement packets produce MOTION state"""
-        ctx = SegmentationContext(window_size=50, threshold=1.0)
+        # Use low threshold appropriate for CV-normalized turbulence (~0.05-0.25 range)
+        ctx = SegmentationContext(window_size=50, threshold=0.001)
         
         motion_count = 0
         for pkt in synthetic_csi_movement_packets:

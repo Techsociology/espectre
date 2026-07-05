@@ -26,27 +26,18 @@ License: GPLv3
 import numpy as np
 import matplotlib.pyplot as plt
 import argparse
-import sys
-from pathlib import Path
 from scipy import signal
 import pywt
 
-# Add micro-espectre and src to path for imports
-_micro_espectre_path = str(Path(__file__).parent.parent)
-_src_path = str(Path(__file__).parent.parent / 'src')
-if _src_path not in sys.path:
-    sys.path.insert(0, _src_path)
-if _micro_espectre_path not in sys.path:
-    sys.path.insert(0, _micro_espectre_path)
+# Import csi_utils first - it sets up paths automatically
+from csi_utils import (
+    calculate_spatial_turbulence, HampelFilter,
+    find_dataset, load_baseline_and_movement
+)
 from config import (SEG_WINDOW_SIZE, SEG_THRESHOLD,
-                    HAMPEL_WINDOW, HAMPEL_THRESHOLD, LOWPASS_CUTOFF)
+                    HAMPEL_WINDOW, HAMPEL_THRESHOLD, LOWPASS_CUTOFF,
+                    DEFAULT_SUBCARRIERS)
 from segmentation import SegmentationContext
-
-from csi_utils import calculate_spatial_turbulence, HampelFilter, find_dataset, DEFAULT_SUBCARRIERS
-from csi_utils import load_baseline_and_movement
-
-# Alias for backward compatibility
-SELECTED_SUBCARRIERS = DEFAULT_SUBCARRIERS
 
 # Alias for backward compatibility
 WINDOW_SIZE = SEG_WINDOW_SIZE
@@ -55,6 +46,13 @@ THRESHOLD = 1.0 if SEG_THRESHOLD == "auto" else SEG_THRESHOLD
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+
+def extract_csi_and_gain_locked(packet):
+    """Extract CSI array and gain lock flag from packet-like input."""
+    if isinstance(packet, dict):
+        return packet['csi_data'], bool(packet.get('gain_locked', True))
+    return packet, True
 
 # Sampling rate
 SAMPLING_RATE = 100.0       # - SAMPLING_RATE: Data acquisition rate in Hz (must match your sensor)
@@ -455,7 +453,7 @@ class FilteredStreamingSegmentation:
     experimentation with different filter configurations.
     """
     
-    def __init__(self, window_size=50, threshold=3.0, filter_config=None, track_data=False):
+    def __init__(self, window_size=SEG_WINDOW_SIZE, threshold=3.0, filter_config=None, track_data=False):
         self.window_size = window_size
         self.threshold = threshold
         self.track_data = track_data
@@ -589,8 +587,13 @@ def run_comparison_test(baseline_packets, movement_packets, num_packets=None, tr
         # Test baseline
         seg.reset()
         baseline_to_process = baseline_packets[:num_packets]
-        for csi_data in baseline_to_process:
-            turbulence = calculate_spatial_turbulence(csi_data, SELECTED_SUBCARRIERS)
+        for packet in baseline_to_process:
+            csi_data, gain_locked = extract_csi_and_gain_locked(packet)
+            turbulence = calculate_spatial_turbulence(
+                csi_data,
+                DEFAULT_SUBCARRIERS,
+                gain_locked=gain_locked
+            )
             seg.add_turbulence(turbulence)
         
         baseline_fp = seg.motion_packets
@@ -611,8 +614,13 @@ def run_comparison_test(baseline_packets, movement_packets, num_packets=None, tr
         # Test movement
         seg.reset()
         movement_to_process = movement_packets[:num_packets]
-        for csi_data in movement_to_process:
-            turbulence = calculate_spatial_turbulence(csi_data, SELECTED_SUBCARRIERS)
+        for packet in movement_to_process:
+            csi_data, gain_locked = extract_csi_and_gain_locked(packet)
+            turbulence = calculate_spatial_turbulence(
+                csi_data,
+                DEFAULT_SUBCARRIERS,
+                gain_locked=gain_locked
+            )
             seg.add_turbulence(turbulence)
         
         movement_tp = seg.motion_packets
@@ -671,8 +679,8 @@ def plot_filter_effect(baseline_packets, movement_packets, num_packets=500):
     Uses production SegmentationContext for consistent results.
     
     Args:
-        baseline_packets: numpy array of CSI data (shape: num_packets x num_subcarriers*2)
-        movement_packets: numpy array of CSI data (shape: num_packets x num_subcarriers*2)
+        baseline_packets: List of CSI packets or packet dicts
+        movement_packets: List of CSI packets or packet dicts
         num_packets: Number of packets to process
     """
     # Configuration for the 4 filter setups (using production SegmentationContext options)
@@ -698,7 +706,12 @@ def plot_filter_effect(baseline_packets, movement_packets, num_packets=500):
         # Process BASELINE
         baseline_mv = []
         for i in range(min(num_packets, len(baseline_packets))):
-            turb = calculate_spatial_turbulence(baseline_packets[i], SELECTED_SUBCARRIERS)
+            csi_data, gain_locked = extract_csi_and_gain_locked(baseline_packets[i])
+            turb = calculate_spatial_turbulence(
+                csi_data,
+                DEFAULT_SUBCARRIERS,
+                gain_locked=gain_locked
+            )
             ctx_baseline.add_turbulence(turb)
             ctx_baseline.update_state()
             baseline_mv.append(ctx_baseline.current_moving_variance)
@@ -716,7 +729,12 @@ def plot_filter_effect(baseline_packets, movement_packets, num_packets=500):
         # Process MOVEMENT
         movement_mv = []
         for i in range(min(num_packets, len(movement_packets))):
-            turb = calculate_spatial_turbulence(movement_packets[i], SELECTED_SUBCARRIERS)
+            csi_data, gain_locked = extract_csi_and_gain_locked(movement_packets[i])
+            turb = calculate_spatial_turbulence(
+                csi_data,
+                DEFAULT_SUBCARRIERS,
+                gain_locked=gain_locked
+            )
             ctx_movement.add_turbulence(turb)
             ctx_movement.update_state()
             movement_mv.append(ctx_movement.current_moving_variance)
@@ -959,14 +977,28 @@ def optimize_filter_parameters(baseline_packets, movement_packets):
         
         # Test baseline
         seg.reset()
-        for csi_data in baseline_packets[:500]:
-            seg.add_turbulence(calculate_spatial_turbulence(csi_data, SELECTED_SUBCARRIERS))
+        for packet in baseline_packets[:500]:
+            csi_data, gain_locked = extract_csi_and_gain_locked(packet)
+            seg.add_turbulence(
+                calculate_spatial_turbulence(
+                    csi_data,
+                    DEFAULT_SUBCARRIERS,
+                    gain_locked=gain_locked
+                )
+            )
         fp = seg.motion_packets
         
         # Test movement
         seg.reset()
-        for csi_data in movement_packets[:500]:
-            seg.add_turbulence(calculate_spatial_turbulence(csi_data, SELECTED_SUBCARRIERS))
+        for packet in movement_packets[:500]:
+            csi_data, gain_locked = extract_csi_and_gain_locked(packet)
+            seg.add_turbulence(
+                calculate_spatial_turbulence(
+                    csi_data,
+                    DEFAULT_SUBCARRIERS,
+                    gain_locked=gain_locked
+                )
+            )
         tp = seg.motion_packets
         
         score = tp - fp * 10
@@ -1029,9 +1061,8 @@ def main():
         print(f"ERROR: {e}")
         return
     
-    # Extract only CSI data
-    baseline_packets = np.array([p['csi_data'] for p in baseline_data])
-    movement_packets = np.array([p['csi_data'] for p in movement_data])
+    baseline_packets = baseline_data
+    movement_packets = movement_data
     
     print(f"  Chip: {chip_name}")
     print(f"  Loaded {len(baseline_packets)} baseline packets")

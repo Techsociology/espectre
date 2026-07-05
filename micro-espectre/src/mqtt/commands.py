@@ -13,14 +13,15 @@ import gc
 import sys
 from src.config import (
     TRAFFIC_GENERATOR_RATE,
-    SEG_WINDOW_SIZE
+    SEG_WINDOW_SIZE,
+    SEG_WINDOW_SIZE_MIN,
+    SEG_WINDOW_SIZE_MAX
 )
 
-# Segmentation limits
-SEG_WINDOW_SIZE_MIN = 10
-SEG_WINDOW_SIZE_MAX = 200
+# Threshold limits (unified with MVS/ML detector runtime validation)
 SEG_THRESHOLD_MIN = 0.0
 SEG_THRESHOLD_MAX = 10.0
+ML_DEFAULT_THRESHOLD = 5.0
 
 class MQTTCommands:
     """MQTT command processor"""
@@ -64,7 +65,11 @@ class MQTTCommands:
         
         info = {
             "algorithm": algorithm,
-            "calibrator": calibrator
+            "calibrator": calibrator,
+            "publish_interval": getattr(self.config, 'PUBLISH_INTERVAL', 100),
+            "evaluation_interval": getattr(self.config, 'EVALUATION_INTERVAL', 25),
+            "motion_on_hits": getattr(self.config, 'MOTION_ON_HITS', 3),
+            "motion_off_hits": getattr(self.config, 'MOTION_OFF_HITS', 3),
         }
         # Add MVS-specific parameters
         if self._is_mvs:
@@ -116,6 +121,7 @@ class MQTTCommands:
         channel_secondary = 0
         bandwidth = "HT20"  # MicroPython ESP32 default
         protocol = "unknown"
+        band_mode = "unknown"
         csi_enabled = False
         
         if self.wlan.active():
@@ -133,7 +139,7 @@ class MQTTCommands:
                 channel_primary = self.wlan.config('channel')
                 # MicroPython doesn't expose secondary channel directly
                 channel_secondary = 0
-            except:
+            except Exception:  # pragma: no cover
                 pass
             
             # WiFi protocol - decode bitmask
@@ -152,13 +158,27 @@ class MQTTCommands:
                 if proto_val & network.MODE_LR:
                     modes.append('LR')
                 protocol = '802.11' + '/'.join(modes) if modes else 'unknown'
-            except:
+            except Exception:  # pragma: no cover
+                pass
+
+            # WiFi band mode (available on modern dual-band firmware)
+            try:
+                band_mode_val = self.wlan.config('band_mode')
+                if band_mode_val == getattr(self.wlan, 'BAND_MODE_2G_ONLY', 1):
+                    band_mode = '2g-only'
+                elif band_mode_val == getattr(self.wlan, 'BAND_MODE_5G_ONLY', 2):
+                    band_mode = '5g-only'
+                elif band_mode_val == getattr(self.wlan, 'BAND_MODE_AUTO', 3):
+                    band_mode = 'auto'
+                else:
+                    band_mode = str(band_mode_val)
+            except Exception:  # pragma: no cover
                 pass
             
             # CSI enabled (indicates promiscuous-like mode for CSI capture)
             try:
                 csi_enabled = hasattr(self.wlan, 'csi_available')
-            except:
+            except Exception:  # pragma: no cover
                 pass
         
         # Get traffic generator rate (current runtime value)
@@ -175,6 +195,7 @@ class MQTTCommands:
                     "primary": channel_primary,
                     "secondary": channel_secondary
                 },
+                "band_mode": band_mode,
                 "bandwidth": bandwidth,
                 "protocol": protocol,
                 "csi_enabled": csi_enabled
@@ -223,7 +244,7 @@ class MQTTCommands:
                 "avg_loop_ms": self.traffic_gen.get_avg_loop_time_ms()
             }
         
-        # Get motion metric (turbulence for MVS, probability for ML)
+        # Get motion metric (moving variance for MVS, scaled metric for ML)
         motion_metric = self.detector.get_motion_metric()
         turbulence = self.detector._context.last_turbulence if self._is_mvs else 0.0
         
@@ -256,7 +277,11 @@ class MQTTCommands:
                 return
             
             old_threshold = self.detector.get_threshold()
-            self.detector.set_threshold(threshold)
+            if not self.detector.set_threshold(threshold):
+                self.send_response(
+                    f"ERROR: Threshold rejected by detector (allowed range: {SEG_THRESHOLD_MIN}-{SEG_THRESHOLD_MAX})"
+                )
+                return
             
             # Note: threshold is session-only, adaptive threshold is recalculated on every boot
             
@@ -309,7 +334,7 @@ class MQTTCommands:
         
         # Reset detector
         self.detector.reset()
-        self.detector.set_threshold(1.0 if self._is_mvs else 0.01)
+        self.detector.set_threshold(1.0 if self._is_mvs else ML_DEFAULT_THRESHOLD)
         
         # Reset MVS-specific parameters
         if self._is_mvs:

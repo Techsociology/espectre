@@ -4,10 +4,14 @@ Micro-ESPectre Configuration
 Author: Francesco Pace <francesco.pace@gmail.com>
 License: GPLv3
 """
+import sys
 
 # WiFi Configuration
 WIFI_SSID = "YourSSID"
 WIFI_PASSWORD = "YourPassword"
+# Optional AP lock for mesh/repeater environments.
+# Format: "AA:BB:CC:DD:EE:FF" (or without separators).
+# WIFI_BSSID = "AA:BB:CC:DD:EE:FF"
 
 # MQTT Configuration
 MQTT_BROKER = "homeassistant.local"  # Your MQTT broker IP
@@ -20,9 +24,17 @@ MQTT_PASSWORD = "mqtt"
 # Traffic Generator Configuration
 # Generates WiFi traffic to ensure continuous CSI data
 TRAFFIC_GENERATOR_RATE = 100  # Default rate (packets per second, recommended: 100)
+TRAFFIC_GENERATOR_MODE = "ping"  # Default mode: "ping" or "dns"
+PUBLISH_INTERVAL = 100        # Packets between periodic MQTT/log updates
+EVALUATION_INTERVAL = 25      # Packets between internal detector evaluations
+MOTION_ON_HITS = 3            # Consecutive evaluated hits required for IDLE -> MOTION
+MOTION_OFF_HITS = 3           # Consecutive evaluated hits required for MOTION -> IDLE
 
 # CSI Configuration
 CSI_BUFFER_SIZE = 8  # Circular buffer size (used to store csi packets until processed)
+
+# Default subcarriers (12 spread across HT20 band)
+DEFAULT_SUBCARRIERS = [12, 14, 16, 18, 20, 24, 28, 36, 40, 44, 48, 52]
 
 # Selected subcarriers for turbulence calculation. None to auto-calibrate at boot.
 #SELECTED_SUBCARRIERS = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
@@ -35,22 +47,26 @@ GAIN_LOCK_MIN_SAFE_AGC = 30   # Minimum safe AGC value (below this, gain lock is
 
 # Detection Algorithm
 # "mvs" (default): Moving Variance Segmentation - fast, good accuracy
-# "ml": Neural Network (12 features -> MLP) - learned patterns, no calibration needed
+# "ml": Neural Network (9 features -> MLP) - learned patterns, no calibration needed
 DETECTION_ALGORITHM = "mvs"
 
 # Band Calibration Configuration (used when SELECTED_SUBCARRIERS is None)
-# "nbvi" (default): NBVI weighted algorithm (normalization scale, 12 non-consecutive subcarriers)
-# "p95": P95 moving variance optimization (12 consecutive subcarriers)
-CALIBRATION_ALGORITHM = "nbvi"
-CALIBRATION_BUFFER_SIZE = 700  # Packets to collect for calibration (7s @ 100Hz, after 3s gain lock)
+# NBVI: Normalized Band Variance Index (12 non-consecutive subcarriers)
+CALIBRATION_NUM_WINDOWS = 10   # Number of windows worth of packets to collect
+# CALIBRATION_BUFFER_SIZE calculated after SEG_WINDOW_SIZE is defined
 
 # Segmentation Parameters
 # SEG_THRESHOLD can be:
-#   - "auto" (default): P95 × 1.4 - minimizes false positives
-#   - "min": P100 × 1.0 - maximum sensitivity (may have false positives)
-#   - a number (0.1-10.0): fixed manual threshold
+#   - "auto" (default): adaptive threshold based on baseline noise
+#   - "min": maximum sensitivity (may have false positives)
+#   - a number (0.0-10.0): fixed manual threshold
 SEG_THRESHOLD = "auto"
-SEG_WINDOW_SIZE = 50          # Moving variance window (packets) - used by both MVS and Features
+SEG_WINDOW_SIZE = 100         # Moving variance window (packets) - used by both MVS and Features
+SEG_WINDOW_SIZE_MIN = 10      # Minimum window size
+SEG_WINDOW_SIZE_MAX = 200     # Maximum window size
+
+# Calibration buffer size = number of windows * window size
+CALIBRATION_BUFFER_SIZE = CALIBRATION_NUM_WINDOWS * SEG_WINDOW_SIZE
 
 # Low-pass filter (removes high-frequency noise, reduces false positives)
 ENABLE_LOWPASS_FILTER = False   # Recommended: reduces FP in noisy environments
@@ -58,9 +74,9 @@ LOWPASS_CUTOFF = 11.0          # Cutoff frequency in Hz (11 Hz: 2.3% FP, 92.4% R
                                # Human movement is typically 0.5-10 Hz, RF noise is >15 Hz
 
 # Hampel filter (removes outliers/spikes in turbulence)
-ENABLE_HAMPEL_FILTER = False   # Enable/disable Hampel outlier filter (spikes in turbulence)
-HAMPEL_WINDOW = 7             # Window size for median calculation (3-9 recommended)
-HAMPEL_THRESHOLD = 4.0        # Outlier detection threshold in MAD units (2.0-4.0 recommended)
+ENABLE_HAMPEL_FILTER = True    # Enable/disable Hampel outlier filter (spikes in turbulence)
+HAMPEL_WINDOW = 7             # Window size for median calculation (3-11)
+HAMPEL_THRESHOLD = 5.0        # Outlier detection threshold in MAD units (2.0-6.0 recommended)
                               # Higher values = less aggressive filtering
 
 # HT20 Constants (64 subcarriers - do not change)
@@ -72,10 +88,12 @@ DC_SUBCARRIER = 32             # DC null subcarrier
 BAND_SIZE = 12                 # Selected subcarriers for motion detection
 
 # Optional local overrides (config_local.py is gitignored)
-try:
-    import src.config_local as _local
-    for _name in dir(_local):
-        if _name.isupper():
-            globals()[_name] = getattr(_local, _name)
-except ImportError:
-    pass
+# Skip local overrides only under pytest to keep tests hermetic.
+if "pytest" not in sys.modules:
+    try:
+        import src.config_local as _local
+        for _name in dir(_local):
+            if _name.isupper():
+                globals()[_name] = getattr(_local, _name)
+    except ImportError:
+        pass

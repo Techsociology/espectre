@@ -14,6 +14,13 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome.components import sensor, binary_sensor, number, switch
 from esphome.components.esp32 import add_extra_build_file, add_idf_sdkconfig_option
+
+# ESPHome 2026.2.0+ excludes unused ESP-IDF components by default
+# include_builtin_idf_component re-enables them when needed
+try:
+    from esphome.components.esp32 import include_builtin_idf_component
+except ImportError:
+    include_builtin_idf_component = None
 from esphome.const import (
     CONF_ID,
     STATE_CLASS_MEASUREMENT,
@@ -22,6 +29,7 @@ from esphome.const import (
     ENTITY_CATEGORY_CONFIG,
     ICON_PULSE,
 )
+from esphome.core import CORE, ID
 
 DEPENDENCIES = ["wifi"]
 AUTO_LOAD = ["sensor", "binary_sensor", "number", "switch"]
@@ -31,6 +39,9 @@ CONF_SEGMENTATION_THRESHOLD = "segmentation_threshold"
 CONF_SEGMENTATION_WINDOW_SIZE = "segmentation_window_size"
 CONF_TRAFFIC_GENERATOR_RATE = "traffic_generator_rate"
 CONF_PUBLISH_INTERVAL = "publish_interval"
+CONF_EVALUATION_INTERVAL = "evaluation_interval"
+CONF_MOTION_ON_HITS = "motion_on_hits"
+CONF_MOTION_OFF_HITS = "motion_off_hits"
 CONF_SELECTED_SUBCARRIERS = "selected_subcarriers"
 
 # Low-pass filter
@@ -49,14 +60,20 @@ CONF_TRAFFIC_GENERATOR_MODE = "traffic_generator_mode"
 # Gain lock mode
 CONF_GAIN_LOCK = "gain_lock"
 
-# Segmentation calibration algorithm
-CONF_SEGMENTATION_CALIBRATION = "segmentation_calibration"
 
 # Detection algorithm
 CONF_DETECTION_ALGORITHM = "detection_algorithm"
 
+# BLE telemetry/control channel
+CONF_BLE_CHANNEL_ENABLED = "ble_channel_enabled"
+CONF_BLE_SERVER_ID = "ble_server_id"
+CONF_BLE_TELEMETRY_CHAR_ID = "ble_telemetry_char_id"
+CONF_BLE_SYSINFO_CHAR_ID = "ble_sysinfo_char_id"
+CONF_BLE_CONTROL_CHAR_ID = "ble_control_char_id"
+CONF_BLE_TELEMETRY_INTERVAL_MS = "ble_telemetry_interval_ms"
+
 # Threshold limits (keep in sync with csi_processor.h)
-THRESHOLD_MIN = 0.1
+THRESHOLD_MIN = 0.0
 THRESHOLD_MAX = 10.0
 THRESHOLD_DEFAULT = 1.0
 
@@ -74,6 +91,9 @@ espectre_ns = cg.esphome_ns.namespace("espectre")
 ESpectreComponent = espectre_ns.class_("ESpectreComponent", cg.Component)
 ESpectreThresholdNumber = espectre_ns.class_("ESpectreThresholdNumber", number.Number, cg.Component)
 ESpectreCalibrateSwitch = espectre_ns.class_("ESpectreCalibrateSwitch", switch.Switch, cg.Component)
+esp32_ble_server_ns = cg.esphome_ns.namespace("esp32_ble_server")
+BLEServer = esp32_ble_server_ns.class_("BLEServer")
+BLECharacteristic = esp32_ble_server_ns.class_("BLECharacteristic")
 
 def validate_segmentation_threshold(value):
     """Validate segmentation_threshold: accepts 'auto', 'min', or a float."""
@@ -98,17 +118,17 @@ CONFIG_SCHEMA = cv.Schema({
     
     # Motion detection parameters
     # segmentation_threshold:
-    #   - auto (default): P95 × 1.4 - low false positives
-    #   - min: P100 × 1.0 - maximum sensitivity (may have FP)
-    #   - number (0.1-10.0): fixed manual threshold
+    #   - auto (default): P95 × 1.1 - balanced sensitivity/false positives
+    #   - min: P100 - maximum sensitivity (may have FP)
+    #   - number (0.0-10.0): fixed manual threshold
     cv.Optional(CONF_SEGMENTATION_THRESHOLD, default="auto"): validate_segmentation_threshold,
-    cv.Optional(CONF_SEGMENTATION_WINDOW_SIZE, default=50): cv.int_range(min=10, max=200),
+    cv.Optional(CONF_SEGMENTATION_WINDOW_SIZE, default=100): cv.int_range(min=10, max=200),
     
     # Traffic generator (0 = disabled, use external WiFi traffic)
     cv.Optional(CONF_TRAFFIC_GENERATOR_RATE, default=100): cv.int_range(min=0, max=1000),
     
-    # Traffic generator mode: dns (default) or ping (ICMP, more compatible)
-    cv.Optional(CONF_TRAFFIC_GENERATOR_MODE, default="dns"): cv.one_of("dns", "ping", lower=True),
+    # Traffic generator mode: ping (default) or dns
+    cv.Optional(CONF_TRAFFIC_GENERATOR_MODE, default="ping"): cv.one_of("dns", "ping", lower=True),
     
     # Gain lock mode: auto (default), enabled, or disabled
     # Auto: enables gain lock but skips if signal too strong (AGC < 30)
@@ -116,15 +136,25 @@ CONFIG_SCHEMA = cv.Schema({
     # Disabled: never lock gain (less stable CSI but works at any distance)
     cv.Optional(CONF_GAIN_LOCK, default="auto"): cv.one_of("auto", "enabled", "disabled", lower=True),
     
-    # Segmentation calibration: nbvi (default) or p95
-    # NBVI: selects 12 non-consecutive subcarriers based on stability metrics
-    # P95: selects 12 consecutive subcarriers minimizing P95 moving variance
-    cv.Optional(CONF_SEGMENTATION_CALIBRATION, default="nbvi"): cv.one_of("p95", "nbvi", lower=True),
     
     # Detection algorithm: mvs (default) or ml
     # MVS: Moving Variance Segmentation - adaptive threshold, general purpose
     # ML: Machine Learning (MLP neural network) - higher accuracy, fixed subcarriers
     cv.Optional(CONF_DETECTION_ALGORITHM, default="mvs"): cv.one_of("mvs", "ml", lower=True),
+    cv.Optional(CONF_EVALUATION_INTERVAL, default=25): cv.int_range(min=1, max=1000),
+    cv.Optional(CONF_MOTION_ON_HITS, default=3): cv.int_range(min=1, max=20),
+    cv.Optional(CONF_MOTION_OFF_HITS, default=3): cv.int_range(min=1, max=20),
+
+    # BLE telemetry/control channel (Web Bluetooth)
+    # "auto" = enable when compatible BLE IDs are present in config
+    cv.Optional(CONF_BLE_CHANNEL_ENABLED, default="auto"): cv.Any(
+        cv.boolean, cv.one_of("auto", lower=True)
+    ),
+    cv.Optional(CONF_BLE_SERVER_ID): cv.use_id(BLEServer),
+    cv.Optional(CONF_BLE_TELEMETRY_CHAR_ID): cv.use_id(BLECharacteristic),
+    cv.Optional(CONF_BLE_SYSINFO_CHAR_ID): cv.use_id(BLECharacteristic),
+    cv.Optional(CONF_BLE_CONTROL_CHAR_ID): cv.use_id(BLECharacteristic),
+    cv.Optional(CONF_BLE_TELEMETRY_INTERVAL_MS, default=40): cv.int_range(min=20, max=500),
     
     # Publish interval in packets (default: same as traffic_generator_rate, or 100 if traffic is 0)
     cv.Optional(CONF_PUBLISH_INTERVAL): cv.int_range(min=1, max=1000),
@@ -140,9 +170,9 @@ CONFIG_SCHEMA = cv.Schema({
     cv.Optional(CONF_LOWPASS_CUTOFF, default=11.0): cv.float_range(min=5.0, max=20.0),
     
     # Hampel filter for turbulence outlier removal
-    cv.Optional(CONF_HAMPEL_ENABLED, default=False): cv.boolean,
+    cv.Optional(CONF_HAMPEL_ENABLED, default=True): cv.boolean,
     cv.Optional(CONF_HAMPEL_WINDOW, default=7): cv.int_range(min=3, max=11),
-    cv.Optional(CONF_HAMPEL_THRESHOLD, default=4.0): cv.float_range(min=1.0, max=10.0),
+    cv.Optional(CONF_HAMPEL_THRESHOLD, default=5.0): cv.float_range(min=1.0, max=10.0),
     
     # Sensors - optional with defaults, always created
     cv.Optional(CONF_MOVEMENT_SENSOR, default={"name": "Movement Score"}): sensor.sensor_schema(
@@ -179,7 +209,62 @@ def _compute_publish_interval(config):
     return config
 
 
-FINAL_VALIDATE_SCHEMA = _compute_publish_interval
+def _normalize_ble_config(config):
+    """Normalize BLE channel configuration."""
+    # Auto mode: enable channel when a known BLE server ID exists.
+    if config.get(CONF_BLE_CHANNEL_ENABLED) == "auto":
+        config[CONF_BLE_CHANNEL_ENABLED] = "esp32_ble_server" in CORE.raw_config
+    return config
+
+
+def _inject_ble_defaults(config):
+    """Inject default BLE IDs when channel is enabled and IDs are omitted."""
+    if not config.get(CONF_BLE_CHANNEL_ENABLED, False):
+        return config
+    if CONF_BLE_SERVER_ID not in config:
+        config[CONF_BLE_SERVER_ID] = ID(
+            "espectre_ble_server", is_declaration=False, type=BLEServer
+        )
+    if CONF_BLE_TELEMETRY_CHAR_ID not in config:
+        config[CONF_BLE_TELEMETRY_CHAR_ID] = ID(
+            "espectre_ble_telemetry", is_declaration=False, type=BLECharacteristic
+        )
+    if CONF_BLE_SYSINFO_CHAR_ID not in config:
+        config[CONF_BLE_SYSINFO_CHAR_ID] = ID(
+            "espectre_ble_sysinfo", is_declaration=False, type=BLECharacteristic
+        )
+    if CONF_BLE_CONTROL_CHAR_ID not in config:
+        config[CONF_BLE_CONTROL_CHAR_ID] = ID(
+            "espectre_ble_control", is_declaration=False, type=BLECharacteristic
+        )
+    return config
+
+
+def _validate_ble_config(config):
+    """Validate BLE telemetry/control channel configuration consistency."""
+    ble_enabled = config.get(CONF_BLE_CHANNEL_ENABLED, False)
+    ble_keys = [
+        CONF_BLE_SERVER_ID,
+        CONF_BLE_TELEMETRY_CHAR_ID,
+        CONF_BLE_SYSINFO_CHAR_ID,
+        CONF_BLE_CONTROL_CHAR_ID,
+    ]
+    if ble_enabled:
+        missing = [k for k in ble_keys if k not in config or config[k] is None]
+        if missing:
+            raise cv.Invalid(
+                "ble_channel_enabled requires these options: "
+                + ", ".join(missing)
+            )
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = cv.All(
+    _compute_publish_interval,
+    _normalize_ble_config,
+    _inject_ble_defaults,
+    _validate_ble_config,
+)
 
 
 async def to_code(config):
@@ -193,6 +278,11 @@ async def to_code(config):
         add_extra_build_file("partitions.csv", partitions_path)
         # Tell PlatformIO to use our custom partition table
         cg.add_platformio_option("board_build.partitions", "partitions.csv")
+    
+    # Re-enable SPIFFS ESP-IDF component (excluded by default since ESPHome 2026.2.0)
+    # Required because calibration_file_buffer.cpp includes esp_spiffs.h
+    if include_builtin_idf_component is not None:
+        include_builtin_idf_component("spiffs")
     
     # Set required sdkconfig options for CSI functionality
     # These are automatically applied - user doesn't need to specify them in YAML
@@ -220,9 +310,13 @@ async def to_code(config):
     cg.add(var.set_traffic_generator_rate(config[CONF_TRAFFIC_GENERATOR_RATE]))
     cg.add(var.set_traffic_generator_mode(config[CONF_TRAFFIC_GENERATOR_MODE]))
     cg.add(var.set_gain_lock_mode(config[CONF_GAIN_LOCK]))
-    cg.add(var.set_segmentation_calibration(config[CONF_SEGMENTATION_CALIBRATION]))
     cg.add(var.set_detection_algorithm(config[CONF_DETECTION_ALGORITHM]))
     cg.add(var.set_publish_interval(config[CONF_PUBLISH_INTERVAL]))
+    cg.add(var.set_evaluation_interval(config[CONF_EVALUATION_INTERVAL]))
+    cg.add(var.set_motion_on_hits(config[CONF_MOTION_ON_HITS]))
+    cg.add(var.set_motion_off_hits(config[CONF_MOTION_OFF_HITS]))
+    cg.add(var.set_ble_channel_enabled(config[CONF_BLE_CHANNEL_ENABLED]))
+    cg.add(var.set_ble_telemetry_interval_ms(config[CONF_BLE_TELEMETRY_INTERVAL_MS]))
     
     # Configure subcarriers if specified
     if CONF_SELECTED_SUBCARRIERS in config:
@@ -264,3 +358,14 @@ async def to_code(config):
     sw = await switch.new_switch(config[CONF_CALIBRATE_SWITCH])
     cg.add(sw.set_parent(var))
     cg.add(var.set_calibrate_switch(sw))
+
+    # Configure BLE channel pointers (optional)
+    if config[CONF_BLE_CHANNEL_ENABLED]:
+        ble_server = await cg.get_variable(config[CONF_BLE_SERVER_ID])
+        telemetry_char = await cg.get_variable(config[CONF_BLE_TELEMETRY_CHAR_ID])
+        sysinfo_char = await cg.get_variable(config[CONF_BLE_SYSINFO_CHAR_ID])
+        control_char = await cg.get_variable(config[CONF_BLE_CONTROL_CHAR_ID])
+        cg.add(var.set_ble_server(ble_server))
+        cg.add(var.set_ble_telemetry_characteristic(telemetry_char))
+        cg.add(var.set_ble_sysinfo_characteristic(sysinfo_char))
+        cg.add(var.set_ble_control_characteristic(control_char))

@@ -8,7 +8,7 @@ Quick guide to tune ESPectre for reliable movement detection in your environment
 
 ## Quick Start (5 minutes)
 
-> **Note on Subcarrier Selection**: ESPectre automatically selects optimal subcarriers at first boot using NBVI (default) or P95 algorithm. No manual configuration needed.
+> **Note on Subcarrier Selection** (MVS only): ESPectre automatically selects optimal subcarriers at boot using the NBVI algorithm. No manual configuration needed. ML mode uses fixed subcarriers.
 
 ### 1. Flash and Boot
 
@@ -22,15 +22,17 @@ esphome logs <your-config>.yaml
 ### 2. Wait for Band Calibration
 
 On first boot, keep the room **empty and still** for 10 seconds. The system will:
-1. Collect ~700 CSI packets during baseline
-2. Run calibration algorithm (NBVI or P95) to select optimal subcarriers
+1. Collect CSI packets during baseline (10 × `window_size`, default 1000 packets)
+2. Run NBVI calibration algorithm to select optimal subcarriers
 3. Select 12 optimal subcarriers for motion detection
-4. Calculate adaptive threshold (P95 × 1.4)
+4. Calculate adaptive threshold based on baseline noise
 
 Look for log messages like:
 ```
-[I][Calibration]: ✓ Calibration successful: [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
+[I][Calibration]: ✓ Calibration successful: [<12 auto-selected subcarriers>]
 ```
+
+NOTE: In ML mode, calibration is skipped and logs show fixed defaults.
 
 ### 3. Test Movement
 
@@ -46,7 +48,7 @@ Look for state changes:
 
 ### 4. Adjust Threshold if Needed
 
-By default, ESPectre uses an **adaptive threshold** calculated automatically during calibration (`P95 × 1.4`). This works well in most environments.
+By default, ESPectre uses an **adaptive threshold** calculated automatically during calibration based on baseline noise. This works well in most environments.
 
 ```yaml
 espectre:
@@ -55,9 +57,9 @@ espectre:
 
 | Value | Description |
 |-------|-------------|
-| `auto` | P95 × 1.4 - Minimizes false positives (default) |
-| `min` | P100 × 1.0 - Maximum sensitivity (may have false positives) |
-| `0.1-10.0` | Fixed manual threshold |
+| `auto` | Adaptive threshold - Minimizes false positives (default) |
+| `min` | Maximum sensitivity (may have false positives) |
+| `0.0-10.0` | Fixed manual threshold |
 
 **Examples:**
 ```yaml
@@ -88,7 +90,7 @@ esphome run <your-config>.yaml
 
 **What it does:** Determines sensitivity for motion detection (MVS only).
 
-**Default:** `auto` (P95 × 1.4, minimizes false positives)
+**Default:** `auto` (adaptive threshold, minimizes false positives)
 
 | Value | Sensitivity | Use Case |
 |-------|-------------|----------|
@@ -100,13 +102,13 @@ esphome run <your-config>.yaml
 **Configuration:**
 ```yaml
 espectre:
-  segmentation_threshold: auto  # or "min" or a number (0.1-10.0)
+  segmentation_threshold: auto  # or "min" or a number (0.0-10.0)
 ```
 
 | Value | Formula | Effect |
 |-------|---------|--------|
-| `auto` | P95 × 1.4 | Minimizes false positives (default) |
-| `min` | P100 × 1.0 | Maximum sensitivity |
+| `auto` | Adaptive | Minimizes false positives (default) |
+| `min` | Maximum sensitivity | Catches faint motion |
 | number | Fixed | Manual override |
 
 **Note:** Runtime adjustments via Home Assistant slider are temporary (session-only). The adaptive threshold is recalculated on every boot.
@@ -124,21 +126,14 @@ espectre:
 
 | Algorithm | Description | Threshold Range | Best For |
 |-----------|-------------|-----------------|----------|
-| `mvs` | Moving Variance Segmentation | 0.1 - 10.0 | General purpose, adaptive |
-| `ml` | Neural Network (MLP 12→16→8→1) | 0.0 - 1.0 | Higher accuracy |
-
-**ML Detector Notes:**
-- Uses fixed subcarriers `[11, 14, 17, 21, 24, 28, 31, 35, 39, 42, 46, 49]` for consistency with training
-- Threshold is a probability (0.5 = 50% confidence)
-- Pre-trained weights are embedded in the component (no external files needed)
-- Architecture validated as optimal (12→16→8→1, 353 params, 1.4 KB) via 5-fold CV
-- Training uses early stopping, dropout, class weights, and LR scheduling
+| `mvs` | Moving Variance Segmentation | 0.0 - 10.0 | General purpose, adaptive |
+| `ml` | Neural network detector | 0.0 - 10.0 (scaled metric) | Calibration-free boot |
 
 ### Window Size (10-200 packets)
 
 **What it does:** Number of turbulence samples used to calculate moving variance.
 
-**Default:** 50 packets
+**Default:** 100 packets
 
 | Value | Response | Stability | Use Case |
 |-------|----------|-----------|----------|
@@ -149,7 +144,7 @@ espectre:
 **Configuration:**
 ```yaml
 espectre:
-  segmentation_window_size: 50
+  segmentation_window_size: 100  # default
 ```
 
 <details>
@@ -171,7 +166,7 @@ For general movement detection, a window is recommended that captures transient 
 | $1$ second | $100$ packets | **Recommended**. Optimal balance, captures $1-2$ steps or a complete gesture. |
 | $2$ seconds | $200$ packets | Slower to react, but very robust against false positives. |
 
-**Recommendation:** Start with $N=50$ packets (corresponding to $0.5$ seconds). This is a good starting point for detecting activities like entering a room.
+**Recommendation:** Start with $N=100$ packets (corresponding to $1$ second at 100 pps). This is the default and a good starting point for detecting activities like entering a room.
 
 </details>
 
@@ -196,7 +191,9 @@ espectre:
 
 ### Publish Interval (1-1000 packets)
 
-**What it does:** Controls how many CSI packets are processed before updating Home Assistant sensors.
+**What it does:** Controls how often ESPectre publishes the movement score and periodic logs.
+The motion binary sensor is no longer tied to this cadence: it is published
+immediately on `IDLE <-> MOTION` state changes.
 
 **Default:** Same as `traffic_generator_rate` (or 100 if traffic generator is disabled)
 
@@ -213,7 +210,31 @@ espectre:
   publish_interval: 50  # Optional: override publish rate
 ```
 
-> **Note:** Lower `publish_interval` values increase CPU usage and Home Assistant traffic but provide more responsive detection.
+> **Note:** Lower `publish_interval` values increase Home Assistant traffic and
+> dashboard refresh frequency, but the internal motion detection cadence is
+> controlled separately by `evaluation_interval`.
+
+### Evaluation Interval (1-1000 packets)
+
+**What it does:** Controls how often the detector state machine is evaluated
+internally. This cadence feeds the binary sensor edge detection and the
+`motion_on_hits` / `motion_off_hits` counters.
+
+**Default:** `25`
+
+**Configuration:**
+```yaml
+espectre:
+  evaluation_interval: 25
+  motion_on_hits: 3
+  motion_off_hits: 3
+```
+
+**How to think about it:**
+- Lower values react faster but evaluate more often
+- Higher values are cheaper but add latency
+- `3` hits with `evaluation_interval: 25` means roughly `75` packets of
+  consistent evidence before changing state
 
 <details>
 <summary><b>Understanding Sampling Rates (Nyquist-Shannon Theorem)</b></summary>
@@ -251,16 +272,16 @@ In Wi-Fi sensing, Fmax is the highest Doppler frequency generated by human movem
 **Status:** Always enabled (automatic)
 
 **How it works:**
-1. During calibration, collects ~700 CSI packets during baseline (room quiet)
-2. **Band selection** uses P95 (fixed algorithm) to rank candidate bands
+1. During calibration, collects 10 × `window_size` CSI packets during baseline (default 1000, room must be quiet)
+2. **Band selection** uses NBVI algorithm to select optimal subcarriers
 3. **Threshold calculation** depends on `segmentation_threshold` setting
 
 | Mode | Formula | Description |
 |------|---------|-------------|
-| `auto` (default) | P95 × 1.4 | Minimizes false positives |
-| `min` | P100 × 1.0 | Maximum sensitivity (threshold = max baseline) |
+| `auto` (default) | P95 × 1.1 | Minimizes false positives |
+| `min` | P100 × 1.0 | Maximum sensitivity |
 
-**Note:** Band selection always uses P95 (the validated algorithm). Only the threshold calculation varies.
+**Note:** Band selection always uses NBVI algorithm. Only the threshold calculation varies.
 
 **Configuration:**
 ```yaml
@@ -289,29 +310,23 @@ espectre:
 
 **Applies to:** Both MVS and ML detectors.
 
-**Default:** Disabled
+**Default:** Enabled (threshold: 5.0 MAD, window: 7)
 
-> ⚠️ **Note:** The Hampel filter is disabled by default because MVS already provides robust motion detection with 0% false positives in typical environments. Enabling it reduces detection sensitivity (Recall drops from 98.1% to 96.3%). Only enable in environments with high electromagnetic interference causing sudden spikes.
+> The Hampel filter removes outlier spikes in turbulence values. With threshold 5.0 it only replaces extreme outliers (>5 MAD from median), preserving motion sensitivity while eliminating false positives caused by transient interference.
 
 **Configuration:**
 ```yaml
 espectre:
-  hampel_enabled: true
-  hampel_window: 7
-  hampel_threshold: 4.0
+  hampel_enabled: true     # default
+  hampel_window: 7         # sliding window size (3-11)
+  hampel_threshold: 5.0    # MAD multiplier, higher = less aggressive
 ```
 
 See [SETUP.md](SETUP.md#configuration-parameters) for parameter details.
 
-**When to enable:**
-- Environments with high electromagnetic interference causing sudden spikes
-- Industrial settings with heavy machinery
-- Proximity to microwave ovens or multiple WiFi access points
-- Experiencing unexplained false positives during baseline (room empty)
-
-**When to keep disabled (default):**
-- Normal home/office environment
-- Maximum detection sensitivity needed
+**When to disable:**
+- If you observe reduced sensitivity in very low-SNR environments
+- When maximum detection sensitivity is needed and the environment has no transient interference
 
 ---
 
@@ -331,17 +346,17 @@ espectre:
 
 | Mode | Description |
 |------|-------------|
-| `auto` | Enable gain lock but skip if signal too strong (AGC < 30). Uses gain compensation when skipped. **Recommended.** |
+| `auto` | Enable gain lock but skip if signal too strong (AGC < 30). Uses CV normalization when skipped. **Recommended.** |
 | `enabled` | Always force gain lock. May freeze if too close to AP. |
-| `disabled` | Never lock gain. Uses gain compensation to normalize amplitudes. Works at any distance. |
+| `disabled` | Never lock gain. Uses CV normalization for stable detection. Works at any distance. |
 
 **How it works:**
 1. During the first 300 packets (~3 seconds), ESPectre collects AGC/FFT samples and calculates the **median** (more robust than mean against outliers)
 2. These values are then "locked" (forced) to eliminate hardware-induced variations
-3. In `auto` mode, if AGC < 30 (signal too strong), gain lock is skipped and **gain compensation** is enabled instead
-4. In `disabled` mode, baseline is collected but never locked; gain compensation normalizes amplitude variations
+3. In `auto` mode, if AGC < 30 (signal too strong), gain lock is skipped and **CV normalization** is enabled instead
+4. In `disabled` mode, baseline is collected but never locked; CV normalization provides stable detection
 
-**Gain compensation:** When gain is not locked (skipped or disabled), CSI amplitudes are normalized using the formula `compensation = 10^((delta_agc + delta_fft) / 20)` where delta is the difference between baseline and current gain values. This maintains detection accuracy without hardware locking.
+**CV normalization:** When gain is not locked (skipped or disabled), spatial turbulence is calculated as the Coefficient of Variation (CV = std/mean) instead of raw standard deviation. This is gain-invariant: if all amplitudes are scaled by factor k (due to AGC), then σ(kA)/μ(kA) = σ(A)/μ(A). This maintains detection accuracy without hardware locking.
 
 **When to change from `auto`:**
 
@@ -404,7 +419,7 @@ The distance between the ESP32 sensor and your WiFi access point (AP) significan
 |----------|------|-----|--------|-------|
 | < 0.5m | > -30 dB | 0-15 | System may freeze | Too close, signal saturated |
 | 0.5-2m | -30 to -40 dB | 15-30 | Marginal | Works with `gain_lock: disabled` |
-| **2-8m** | -40 to -70 dB | **30-60** | **Optimal** | Best CSI quality and stability |
+| **3-8m** | -40 to -70 dB | **30-60** | **Optimal** | Best CSI quality and stability |
 | 8-15m | -70 to -80 dB | 60-80 | Good | Still reliable detection |
 | > 15m | < -80 dB | > 80 | Reduced quality | Weaker signal, more noise |
 
@@ -525,6 +540,8 @@ Look at the gain lock log after WiFi connection:
 
 4. **Check router compatibility:** Some mesh routers or WiFi 6E may have issues
 
+5. **If protocol/bandwidth logs show `unavailable`:** this can happen on some target/band mode API paths and does not automatically mean CSI is broken. Focus on CSI packet flow (`pps`, dropped packets, calibration progress) to assess runtime health.
+
 ### System Freezes During Calibration
 
 **Symptoms:** Device freezes after "Auto-Calibration Starting (file-based storage)" message. May show watchdog timeout or repeated "ping_sock: send error=0" messages.
@@ -606,9 +623,9 @@ vs.
 2. **Avoid DFS channels:** Channels 52-144 (5GHz DFS) may switch unexpectedly due to radar detection
 3. **Check for interference:** Nearby networks on the same channel can cause instability
 
-### Runtime Recalibration
+### Runtime Recalibration (MVS only)
 
-**When needed:** Recalibrate without reflashing (e.g., after moving furniture or changing room layout).
+**When needed:** Recalibrate without reflashing (e.g., after moving furniture or changing room layout). This applies only to MVS mode; ML uses fixed subcarriers embedded in the model.
 
 **How to recalibrate from Home Assistant:**
 
@@ -618,7 +635,7 @@ vs.
 4. The switch will automatically turn OFF when calibration completes
 
 **Important:**
-- Keep the room quiet and empty during calibration (~10 seconds)
+- Keep the room quiet and empty during calibration (~13 seconds)
 - The switch is disabled during calibration to prevent interruption
 - You cannot cancel calibration once started
 
@@ -629,9 +646,9 @@ vs.
 [I][espectre]: Calibration completed successfully
 ```
 
-### Reset Calibration (Full Erase)
+### Reset Calibration (MVS only)
 
-**When needed:** Start completely fresh with new subcarrier selection and clear all saved settings.
+**When needed:** Start completely fresh with new subcarrier selection and clear all saved settings. This applies only to MVS mode.
 
 **How to reset:**
 
@@ -645,7 +662,7 @@ vs.
 
 **After reset:**
 - Keep room quiet and empty for 10 seconds
-- P95 band selection will automatically recalibrate
+- NBVI band selection will automatically recalibrate
 - Check logs for "Calibration successful"
 
 ---
@@ -671,7 +688,7 @@ After integration, monitor sensors in Home Assistant:
 
 Use **History** graphs to visualize detection patterns over time.
 
-**Tip:** You can adjust the threshold directly from Home Assistant without re-flashing. Changes are session-only - the adaptive threshold (P95 × 1.4) is recalculated on every boot.
+**Tip:** You can adjust the threshold directly from Home Assistant without re-flashing. Changes are session-only - the adaptive threshold is recalculated on every boot.
 
 ---
 
@@ -681,9 +698,9 @@ Use **History** graphs to visualize detection patterns over time.
 2. **One change at a time:** Adjust one parameter, re-flash, test for 5-10 minutes
 3. **Document your settings:** Note what works for your environment
 4. **Seasonal adjustments:** Retune when furniture changes or new interference sources appear
-5. **Distance matters:** Keep sensor 2-8m from router (RSSI between -40 and -70 dB for best results)
+5. **Distance matters:** Keep sensor 3-8m from router (RSSI between -40 and -70 dB for best results)
 6. **Check AGC value:** After boot, look for "Gain locked: AGC=XX" - values 30-60 are optimal
-7. **Quiet calibration:** Ensure no movement during first 5-10 seconds after boot
+7. **Quiet calibration:** Ensure no movement during first ~13 seconds after boot
 8. **Try the game:** Use [ESPectre - The Game](https://espectre.dev/game) for interactive threshold tuning with real-time visual feedback
 
 ---

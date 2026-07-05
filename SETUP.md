@@ -16,8 +16,8 @@ Choose one of the two installation methods below:
 
 **Hardware:**
 - **ESP32 board** with CSI support:
-  - ✅ Tested: ESP32-S3, ESP32-C6, ESP32-C3, ESP32 (original)
-  - ⚠️ Experimental: ESP32-S2, ESP32-C5
+  - ✅ Tested: ESP32-S3, ESP32-C6, ESP32-C5, ESP32-C3, ESP32 (original)
+  - ⚠️ Experimental: ESP32-S2
 - **USB cable** (USB-C or Micro-USB, depending on your board)
 - **Wi-Fi router** (2.4 GHz, 802.11b/g/n/ax)
 
@@ -59,7 +59,7 @@ That's it! The device will be automatically discovered by Home Assistant.
 
 **Software:**
 - Python 3.12 (⚠️ Python 3.14 has known issues with ESPHome)
-- ESPHome 2024.x or newer
+- ESPHome 2026.5.0 or newer
 - Home Assistant (recommended, but optional)
 
 ### 1. Install ESPHome
@@ -84,10 +84,12 @@ Download the example configuration for your hardware:
 | **ESP32-S3** | [espectre-s3.yaml](https://raw.githubusercontent.com/francescopace/espectre/main/examples/espectre-s3.yaml) | Xtensa @ 240MHz | WiFi 4 | ✅ 8MB | ✅ Tested |
 | **ESP32-C3** | [espectre-c3.yaml](https://raw.githubusercontent.com/francescopace/espectre/main/examples/espectre-c3.yaml) | RISC-V @ 160MHz | WiFi 4 | ❌ | ✅ Tested ² |
 | **ESP32** | [espectre-esp32.yaml](https://raw.githubusercontent.com/francescopace/espectre/main/examples/espectre-esp32.yaml) | Xtensa @ 240MHz | WiFi 4 | Optional | ✅ Tested ³ |
-| **ESP32-C5** | [espectre-c5.yaml](https://raw.githubusercontent.com/francescopace/espectre/main/examples/espectre-c5.yaml) | RISC-V @ 240MHz | WiFi 6 capable | ❌ | ⚠️ Experimental ¹ |
+| **ESP32-C5** | [espectre-c5.yaml](https://raw.githubusercontent.com/francescopace/espectre/main/examples/espectre-c5.yaml) | RISC-V @ 240MHz | WiFi 6 capable | ❌ | ✅ Tested ¹ |
 | **ESP32-S2** | [espectre-s2.yaml](https://raw.githubusercontent.com/francescopace/espectre/main/examples/espectre-s2.yaml) | Xtensa @ 240MHz | WiFi 4 | Optional | ⚠️ Experimental |
 
 > **Note**: ESPectre uses WiFi 4 (802.11b/g/n) mode for stable 64 subcarriers and faster calibration, even on WiFi 6 capable chips (C5, C6). This ensures consistent performance across all platforms.
+>
+> On ESP32-C5, ESPectre also forces `2.4 GHz only` band mode at runtime to avoid unintended 5 GHz association and keep CSI behavior stable.
 
 **Recommendations**:
 - **ESP32-C6**: Modern RISC-V platform, good performance, compact form factor
@@ -96,14 +98,14 @@ Download the example configuration for your hardware:
 
 These files are pre-configured to download the component automatically from GitHub.
 
-> ⚠️ **Experimental platforms**: ESP32-S2 and ESP32-C5 have CSI support but have not been extensively tested. Please report your results on [GitHub Discussions](https://github.com/francescopace/espectre/discussions)!
+> ⚠️ **Experimental platform**: ESP32-S2 has CSI support but has not been extensively tested. Please report your results on [GitHub Discussions](https://github.com/francescopace/espectre/discussions)!
 >
 > ¹ ESP32-C5: `improv_serial` (USB provisioning) not yet supported by ESPHome. Use BLE or WiFi AP provisioning instead.
 >
 >
 > ³ ESP32 (original/WROOM-32): AGC/FFT gain lock is not available on this platform. Band calibration works but CSI amplitudes may have more variance than newer chips.
 >
-> ⁴ **Boards with USB-UART bridges** (CH340, CP2102, CH343): If you don't see logs after flashing, use the UART configurations in [`examples/uart/`](https://github.com/francescopace/espectre/tree/main/examples/uart) which enable logging on UART0.
+> ⁴ **Boards with USB-UART bridges** (CH340, CP2102, CH343): If you don't see logs after flashing, uncomment the `hardware_uart: UART0` line in the `logger:` section of your configuration file to enable logging on UART0.
 
 ### 3. Build and flash
 
@@ -162,7 +164,9 @@ Use the development configuration files (with debug sensors and local component 
 | Platform | Development File |
 |----------|-----------------|
 | **ESP32-C6** | `examples/espectre-c6-dev.yaml` |
+| **ESP32-C5** | `examples/espectre-c5-dev.yaml` |
 | **ESP32-S3** | `examples/espectre-s3-dev.yaml` |
+| **ESP32-C3** | `examples/espectre-c3-dev.yaml` |
 | **ESP32** | `examples/espectre-esp32-dev.yaml` |
 
 ```bash
@@ -221,45 +225,32 @@ All parameters can be adjusted in the YAML file under the `espectre:` section:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `detection_algorithm` | string | mvs | Detection algorithm: `mvs` (variance) or `ml` (neural network) |
-| `segmentation_calibration` | string | nbvi | Band selection (MVS only): `nbvi` or `p95` |
-| `traffic_generator_rate` | int | 100 | Packets/sec for CSI generation (0=disabled, use external traffic) |
-| `traffic_generator_mode` | string | dns | Traffic generator mode: `dns` (UDP queries) or `ping` (ICMP) |
-| `publish_interval` | int | auto | Packets between sensor updates (default: same as traffic_generator_rate, or 100 if traffic is 0) |
-| `segmentation_threshold` | string/float | auto | Threshold: `auto`, `min`, or number (MVS: 0.1-10.0, ML: 0.0-1.0) |
-| `segmentation_window_size` | int | 50 | Moving variance window in packets |
+| `traffic_generator_rate` | int | 100 | Packets/sec for CSI generation (0-1000, 0=disabled) |
+| `traffic_generator_mode` | string | ping | Traffic generator mode: `ping` (ICMP) or `dns` (UDP queries) |
+| `publish_interval` | int | auto | Packets between periodic sensor/log updates (default: same as traffic_generator_rate, or 100 if traffic is 0) |
+| `evaluation_interval` | int | 25 | Packets between internal detector state evaluations |
+| `motion_on_hits` | int | 3 | Consecutive evaluated hits required before switching the binary sensor to `MOTION` |
+| `motion_off_hits` | int | 3 | Consecutive evaluated hits required before switching the binary sensor back to `IDLE` |
+| `segmentation_threshold` | string/float | auto | Threshold: `auto`, `min`, or number (0.0-10.0 for both MVS and ML) |
+| `segmentation_window_size` | int | 100 | Moving variance window in packets (10-200) |
 | `selected_subcarriers` | list | auto | Fixed subcarriers (omit for auto-calibration) |
 | `lowpass_enabled` | bool | false | Enable low-pass filter for noise reduction (MVS and ML) |
 | `lowpass_cutoff` | float | 11.0 | Low-pass filter cutoff frequency in Hz (5-20) |
-| `hampel_enabled` | bool | false | Enable Hampel outlier filter (MVS and ML) |
-| `hampel_window` | int | 7 | Hampel filter window size |
-| `hampel_threshold` | float | 4.0 | Hampel filter sensitivity (MAD multiplier) |
+| `hampel_enabled` | bool | true | Enable Hampel outlier filter (MVS and ML) |
+| `hampel_window` | int | 7 | Hampel filter window size (3-11) |
+| `hampel_threshold` | float | 5.0 | Hampel filter sensitivity (MAD multiplier) (1.0-10.0) |
 | `gain_lock` | string | auto | AGC/FFT gain lock: `auto`, `enabled`, `disabled` |
+| `ble_channel_enabled` | bool/string | auto | Enable BLE telemetry/control channel: `auto`, `true`, `false` |
+| `ble_telemetry_interval_ms` | int | 40 | BLE telemetry notify interval in ms (20-500) |
 
 For detailed parameter tuning (ranges, recommended values, troubleshooting), see [TUNING.md](TUNING.md).
-
-### Choosing Calibration Algorithm
-
-The calibration algorithm selects which subcarriers to monitor.
-
-| Algorithm | Selection Method | Pros | Cons | Best For |
-|-----------|-----------------|------|------|----------|
-| **NBVI** (default) | 12 best non-consecutive subcarriers | Spectral diversity, resilient to narrowband interference | Slightly more complex | Default choice, environments with potential interference |
-| **P95** | 12 consecutive subcarriers with lowest P95 variance | Simple, consistent band | All eggs in one basket | Clean RF environments, debugging |
-
-**Recommendation:** Use NBVI (default). Both achieve similar detection accuracy (~95% recall, <1% FP rate), but NBVI is more resilient to narrowband interference.
-
-```yaml
-espectre:
-  segmentation_calibration: nbvi  # default, recommended
-  # segmentation_calibration: p95  # simpler, contiguous band
-```
 
 ### Choosing Detection Algorithm
 
 | Algorithm | How It Works | Pros | Cons | Best For |
 |-----------|--------------|------|------|----------|
-| **MVS** (default) | Variance of spatial turbulence | Low CPU, adaptive threshold | Requires 10s calibration | General use |
-| **ML** | Neural network (MLP 12→16→8→1) | Fast boot (~3s), fixed subcarriers | Pre-trained weights | Experimental |
+| **MVS** (default) | Variance of spatial turbulence | Low CPU, adaptive threshold | Requires 10s NBVI calibration | General use |
+| **ML** | Neural network (MLP 9→32→16→1) | Fast boot (~3s), no calibration | Pre-trained weights, fixed subcarriers | Experimental |
 
 Both algorithms support optional low-pass and Hampel filters on the turbulence stream.
 
@@ -268,9 +259,10 @@ espectre:
   detection_algorithm: mvs  # or ml
 ```
 
-**Threshold ranges:**
-- MVS: 0.1 - 10.0 (default: auto = P95 × 1.4)
-- ML: 0.0 - 1.0 (default: 0.5, probability)
+**Threshold ranges (unified for both algorithms):**
+- Range: 0.0 - 10.0
+- MVS default: `auto` (adaptive based on baseline noise)
+- ML default: 5.0 (equivalent to 0.5 probability)
 
 ### Integrated Sensors (Created Automatically)
 
@@ -278,8 +270,8 @@ All sensors are created automatically when the `espectre` component is configure
 
 | Sensor Config | Type | Default Name | Description |
 |---------------|------|--------------|-------------|
-| `movement_sensor` | sensor | "Movement Score" | Current motion intensity value |
-| `motion_sensor` | binary_sensor | "Motion Detected" | Motion state (on/off) |
+| `movement_sensor` | sensor | "Movement Score" | Current motion score on a 0-10 scale (more gradual in ML mode) |
+| `motion_sensor` | binary_sensor | "Motion Detected" | Edge-driven motion state (on/off), filtered by `evaluation_interval` and hit counters |
 | `threshold_number` | number | "Threshold" | Detection threshold (adjustable from HA) |
 | `calibrate_switch` | switch | "Calibrate" | Trigger band recalibration (ON during calibration) |
 
@@ -296,11 +288,15 @@ All sensor entities support standard ESPHome options:
 
 The `movement_sensor` also supports ESPHome [sensor filters](https://esphome.io/components/sensor/#sensor-filters) for data transformation.
 
+- **MVS mode**: publishes the current moving-variance based metric
+- **ML mode**: publishes a 0-10 confidence-like score derived from the neural network output
+- **ML temperature scaling**: the ML score is intentionally softened before the sigmoid so Home Assistant can show intermediate values instead of a nearly binary 0/10 output
+
 Common filters:
 
 | Filter | Example | Description |
 |--------|---------|-------------|
-| `multiply` | `multiply: 100` | Scale values (e.g., 0-1 → 0-100) |
+| `multiply` | `multiply: 10` | Scale values (e.g., 0-10 → 0-100) |
 | `round` | `round: 1` | Round to N decimal places |
 | `clamp` | `min_value: 0, max_value: 100` | Limit value range |
 | `offset` | `offset: -0.5` | Add/subtract constant |
@@ -443,7 +439,7 @@ The traffic generator creates network packets that trigger CSI callbacks from th
 ```yaml
 espectre:
   traffic_generator_rate: 100  # packets per second (0-1000)
-  traffic_generator_mode: dns  # dns (default) or ping
+  traffic_generator_mode: ping  # ping (default) or dns
 ```
 
 ### Traffic Generator Mode
@@ -452,20 +448,20 @@ Two modes are available:
 
 | Mode | Protocol | Description |
 |------|----------|-------------|
-| `dns` | UDP | Sends DNS queries to gateway:53. Works with most routers. (default) |
-| `ping` | ICMP | Sends ICMP echo requests to gateway. Alternative if DNS doesn't work. |
+| `ping` | ICMP | Sends ICMP echo requests to gateway. Default mode, more reliable on routers that ignore root-domain DNS queries. |
+| `dns` | UDP | Sends DNS queries to gateway:53. Lower-overhead alternative when DNS works well in your environment. |
 
 Both modes generate minimal network traffic (<20 bytes per packet). 
 
 **Choosing a mode:**
-- Start with `dns` (default) - works with most home routers
-- Try `ping` if you get low packet rates - some routers don't respond to root domain DNS queries
+- Start with `ping` (default) - more reliable when routers ignore root-domain DNS queries
+- Try `dns` if you prefer lower-overhead UDP traffic and your router responds consistently
 - Note: some routers/firewalls may rate-limit or block ICMP ping responses
 
 ```yaml
 espectre:
   traffic_generator_rate: 100
-  traffic_generator_mode: ping  # Use ICMP ping instead of DNS
+  traffic_generator_mode: dns  # Use DNS queries instead of the default ping mode
 ```
 
 **Community test results** (thanks to [@gasment](https://github.com/francescopace/espectre/issues/48)):
@@ -506,7 +502,8 @@ You can disable the internal traffic generator and rely on external WiFi traffic
 ```yaml
 espectre:
   traffic_generator_rate: 0      # Disable internal generator
-  publish_interval: 100          # Publish sensors every 100 packets
+  publish_interval: 100          # Publish movement score/logs every 100 packets
+  evaluation_interval: 25        # Re-evaluate motion state every 25 packets
 ```
 
 This is useful when:
@@ -617,18 +614,22 @@ High airtime (>30-50%) causes network congestion, increased latency, and packet 
 
 ---
 
-## Auto-Calibration
+## Auto-Calibration (MVS only)
 
-> ⚠️ **CRITICAL**: The room must be **still** during the first 10 seconds after boot. Movement during calibration will result in poor detection accuracy!
+> ⚠️ **CRITICAL**: The room must be **still** during the first ~13 seconds after boot. Movement during calibration will result in poor detection accuracy!
+
+Auto-calibration applies only to MVS mode. ML mode uses fixed subcarriers from pre-trained weights and skips this phase.
 
 ESPectre automatically calibrates in two phases:
 
 1. **Gain Lock** (~3 seconds, 300 packets): Stabilizes AGC/FFT for consistent amplitudes
-2. **P95 Band Calibration** (~7 seconds, 700 packets): Selects optimal 12-subcarrier band and calculates adaptive threshold
+2. **NBVI Band Calibration** (~10 seconds, 10 × `window_size` packets): Selects optimal 12-subcarrier band and calculates adaptive threshold
+
+With default `segmentation_window_size: 100`, the calibration collects 1000 packets. If you change the window size, the calibration buffer adjusts automatically.
 
 Room must be quiet during the entire ~10 second calibration.
 
-**Sensor placement:** Position the sensor 2-8 meters from your access point for optimal performance. See [Sensor Placement](TUNING.md#sensor-placement) in the Tuning Guide for details.
+**Sensor placement:** Position the sensor 3-8 meters from your access point for optimal performance. See [Sensor Placement](TUNING.md#sensor-placement) in the Tuning Guide for details.
 
 **Gain lock modes:** The `gain_lock` parameter (`auto`/`enabled`/`disabled`) controls AGC stabilization. See [Gain Lock](TUNING.md#gain-lock) in the Tuning Guide.
 
@@ -753,13 +754,75 @@ spiffs,   data, spiffs,  0x7D0000, 0x30000,
 
 ---
 
+## BLE Control API (Optional)
+
+ESPectre can expose a BLE telemetry/control channel for custom integrations, even without Home Assistant.
+
+For the complete protocol reference (UUIDs, commands, limits, and frame examples), see [docs/game/README.md#communication-protocol](docs/game/README.md#communication-protocol).
+
+Minimal setup:
+
+```yaml
+espectre:
+  ble_channel_enabled: auto
+  ble_telemetry_interval_ms: 40
+
+esp32_ble_server:
+  id: espectre_ble_server
+  services:
+    - uuid: "d33ff46b-2203-4775-bc6f-b3a2c36af8f0"
+      advertise: true
+      characteristics:
+        - id: espectre_ble_telemetry
+          uuid: "119d5cac-48da-4bd9-bfc3-169805868258"
+          notify: true
+        - id: espectre_ble_sysinfo
+          uuid: "c8c89ffa-c401-461f-9ffc-942fa04adfe3"
+          read: true
+          notify: true
+          value: ""
+        - id: espectre_ble_control
+          uuid: "33ed9214-a8d7-40e8-82d1-c82747dcdc71"
+          write: true
+          write_no_response: true
+```
+
+Use this channel with any standard BLE client by implementing the same UUID/profile contract.
+
+If you do not use BLE integrations, you can remove the `esp32_ble_server:` section entirely. With `ble_channel_enabled: auto` (default), ESPectre will keep the BLE channel disabled when no BLE server is configured.
+
+This can slightly reduce runtime overhead (RAM/CPU usage and BLE radio activity), which may be useful on constrained boards or when you only use Home Assistant entities.
+
+---
+
 ## Troubleshooting
+
+### WiFi protocol/bandwidth shows "unavailable"
+
+On some targets or band modes, the WiFi driver may not expose protocol/bandwidth values through all read APIs. In this case, ESPectre logs:
+
+```
+WiFi Protocol: unavailable (...)
+WiFi Bandwidth: unavailable (...)
+```
+
+This is expected for unsupported read paths and does not necessarily indicate a WiFi connection failure.
+
+### CSI packet length warnings (`wrong SC count`)
+
+ESPectre expects HT20 CSI payloads mapped to `128 bytes` (64 subcarriers). Runtime normalization already handles common alternate lengths:
+
+- `256 -> 128` (double HT-LTF / STBC-like packet)
+- `228 -> 114 -> 128` (double short HT estimate, then remap)
+- `114 -> 128` (57-subcarrier short HT estimate remapped to 64)
+
+If you still see repeated `Filtered ... wrong SC count` warnings, packets are likely arriving in another unsupported format. In that case, keep an eye on the logged metadata (`ch`, `bb`/`sig_mode`, `est_len`) and open an issue with logs and target chip/AP details.
 
 ### No motion detection
 
 1. **Verify traffic generator is enabled** (`traffic_generator_rate > 0`)
 2. Check WiFi is connected (look for IP address in logs)
-3. Wait for band calibration to complete (~10 seconds after boot)
+3. Wait for band calibration to complete (~13 seconds after boot)
 4. Adjust `segmentation_threshold` (try 0.5-2.0 for more sensitivity)
 
 ### False positives
@@ -768,13 +831,15 @@ spiffs,   data, spiffs,  0x7D0000, 0x30000,
 2. Check for interference sources (fans, AC, moving curtains)
 3. Increase `segmentation_window_size` for more stable detection
 
-### Calibration fails
+### Calibration fails (MVS only)
 
-1. Ensure room is quiet during calibration (first 5-10 seconds after boot)
+Applies only when `detector_algorithm: mvs` (default). The `ml` detector does not use NBVI calibration.
+
+1. Ensure room is quiet during calibration (first ~13 seconds after boot)
 2. Check traffic generator is running
 3. Verify WiFi connection is stable
 
-**Note:** If band selection fails, the system automatically falls back to default subcarriers [11-22] with a default threshold of 1.0. Motion detection will work but may be less optimal. Look for the log message `⚠ Fallback calibration: using default subcarriers`.
+**Note:** If band selection fails, the system automatically falls back to the shared default subcarriers `[12, 14, 16, 18, 20, 24, 28, 36, 40, 44, 48, 52]` with a default threshold of `1.0`. Motion detection still works but may be less optimal. Look for the log message `⚠ Fallback calibration: using default subcarriers`.
 
 ### SPIFFS partition not found
 

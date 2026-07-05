@@ -14,6 +14,7 @@
 #include "nbvi_calibrator.h"
 #include "csi_manager.h"
 #include "mvs_detector.h"
+#include "utils.h"
 #include "wifi_csi_interface.h"
 #include "esphome/core/log.h"
 
@@ -28,7 +29,7 @@ using namespace esphome::espectre;
 static const char *TAG = "test_nbvi_calibrator";
 
 // Default subcarrier selection for testing
-static const uint8_t DEFAULT_BAND[12] = {11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22};
+static const uint8_t* const DEFAULT_BAND = DEFAULT_SUBCARRIERS;
 
 /**
  * Mock WiFi CSI for testing
@@ -176,17 +177,12 @@ void test_nbvi_calibrator_start_calibration(void) {
 
 void test_nbvi_calibrator_start_calibration_while_calibrating(void) {
     NBVICalibrator calibrator;
-    calibrator.init(&g_csi_manager);
+    calibrator.init(&g_csi_manager, "/tmp/test_nbvi_cal.bin");
     
     auto callback = [](const uint8_t*, uint8_t, const std::vector<float>&, bool) {};
     
     esp_err_t first_result = calibrator.start_calibration(DEFAULT_BAND, 12, callback);
-    
-    // Skip test if SPIFFS not available
-    if (first_result == 0x101) {
-        TEST_IGNORE_MESSAGE("SPIFFS not available on native platform");
-        return;
-    }
+    TEST_ASSERT_EQUAL(ESP_OK, first_result);
     
     esp_err_t result = calibrator.start_calibration(DEFAULT_BAND, 12, callback);
     TEST_ASSERT_EQUAL(ESP_ERR_INVALID_STATE, result);
@@ -208,17 +204,12 @@ void test_nbvi_calibrator_add_packet_when_not_calibrating(void) {
 
 void test_nbvi_calibrator_add_packet_during_calibration(void) {
     NBVICalibrator calibrator;
-    calibrator.init(&g_csi_manager);
+    calibrator.init(&g_csi_manager, "/tmp/test_nbvi_cal.bin");
     calibrator.set_buffer_size(10);  // Small buffer for testing
     
     auto callback = [](const uint8_t*, uint8_t, const std::vector<float>&, bool) {};
     esp_err_t result = calibrator.start_calibration(DEFAULT_BAND, 12, callback);
-    
-    // Skip test if SPIFFS not available
-    if (result == 0x101) {
-        TEST_IGNORE_MESSAGE("SPIFFS not available on native platform");
-        return;
-    }
+    TEST_ASSERT_EQUAL(ESP_OK, result);
     
     int8_t csi_buf[128] = {0};
     bool buffer_full = false;
@@ -258,17 +249,12 @@ void test_nbvi_calibrator_add_real_packets(void) {
     }
     
     NBVICalibrator calibrator;
-    calibrator.init(&g_csi_manager);
+    calibrator.init(&g_csi_manager, "/tmp/test_nbvi_cal.bin");
     calibrator.set_buffer_size(50);  // Small buffer for faster test
     
     auto callback = [](const uint8_t*, uint8_t, const std::vector<float>&, bool) {};
     esp_err_t result = calibrator.start_calibration(DEFAULT_BAND, 12, callback);
-    
-    // Skip test if SPIFFS not available
-    if (result == 0x101) {
-        TEST_IGNORE_MESSAGE("SPIFFS not available on native platform");
-        return;
-    }
+    TEST_ASSERT_EQUAL(ESP_OK, result);
     
     bool buffer_full = false;
     int packets_added = 0;

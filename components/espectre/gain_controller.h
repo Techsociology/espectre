@@ -56,14 +56,12 @@ enum class GainLockMode {
 //   AGC < 30: freezes after gain lock
 static constexpr uint8_t MIN_SAFE_AGC = 30;
 
+#if ESPECTRE_GAIN_LOCK_SUPPORTED
 /**
  * PHY RX Control structure with gain fields
  * 
  * This structure overlays wifi_csi_info_t to access undocumented
  * PHY fields (agc_gain and fft_gain) that are present on newer ESP32 variants.
- * 
- * Based on Espressif esp-csi example:
- * https://github.com/espressif/esp-csi/blob/master/examples/get-started/csi_recv_router/main/app_main.c
  */
 typedef struct {
     unsigned : 32;  // reserved
@@ -71,27 +69,18 @@ typedef struct {
     unsigned : 32;  // reserved
     unsigned : 32;  // reserved
     unsigned : 32;  // reserved
-#if CONFIG_IDF_TARGET_ESP32S2
-    unsigned : 32;  // reserved
-#elif ESPECTRE_GAIN_LOCK_SUPPORTED
     unsigned : 16;  // reserved
     signed fft_gain : 8;     // FFT scaling gain (signed per Espressif API)
     unsigned agc_gain : 8;   // Automatic Gain Control value
     unsigned : 32;  // reserved
-#endif
     unsigned : 32;  // reserved
-#if CONFIG_IDF_TARGET_ESP32S2
-    signed : 8;     // reserved
-    unsigned : 24;  // reserved
-#elif CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
+#if CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32C3 || CONFIG_IDF_TARGET_ESP32C5 || CONFIG_IDF_TARGET_ESP32C6
     unsigned : 32;  // reserved
     unsigned : 32;  // reserved
     unsigned : 32;  // reserved
 #endif
     unsigned : 32;  // reserved
 } wifi_pkt_rx_ctrl_phy_t;
-
-#if ESPECTRE_GAIN_LOCK_SUPPORTED
 // External PHY functions (from ESP-IDF PHY blob, not in public headers)
 extern "C" {
     /**
@@ -119,7 +108,7 @@ extern "C" {
  * 
  * The gain lock phase happens BEFORE band calibration to ensure clean data:
  * - Phase 1: Gain Lock (~3 seconds, 300 packets) - locks AGC/FFT using median
- * - Phase 2: Band Calibration (~7 seconds, 700 packets) - with stable gain
+ * - Phase 2: Band Calibration (~10 seconds, 1000 packets) - with stable gain
  */
 class GainController {
  public:
@@ -233,36 +222,25 @@ class GainController {
   static constexpr uint16_t get_subcarrier_count() { return 64; }
   
   /**
-   * Check if gain compensation is needed
+   * Check if CV normalization is needed
    * 
-   * Compensation is needed when gain lock was skipped (strong signal)
-   * or when mode is DISABLED. In these cases, AGC/FFT vary dynamically.
+   * CV normalization (dividing by mean) is needed whenever AGC/FFT are not
+   * effectively locked. That includes:
+   * - strong-signal AUTO fallback (gain lock skipped)
+   * - explicit DISABLED mode
+   * - platforms that do not expose PHY gain-lock APIs at all
+   *
+   * In these cases, AGC/FFT can vary dynamically and CV normalization provides
+   * stable turbulence values aligned with the training pipeline used for
+   * `gain_locked=false` datasets.
    * 
-   * @return true if compensation should be applied
+   * @return true if CV normalization should be applied
    */
-  bool needs_compensation() const {
-    return skipped_strong_signal_ || mode_ == GainLockMode::DISABLED;
+  bool needs_cv_normalization() const {
+    return skip_gain_lock_ || skipped_strong_signal_ || mode_ == GainLockMode::DISABLED;
   }
   
-  /**
-   * Calculate gain compensation factor for a CSI packet
-   * 
-   * Compares current AGC/FFT values with baseline and returns
-   * a factor to normalize CSI amplitudes.
-   * 
-   * Formula: 10^((baseline_agc - current_agc) / 20) *
-   *          10^((baseline_fft - current_fft) / 20)
-   * 
-   * @param info CSI packet info
-   * @return Compensation factor (1.0 if no compensation needed)
-   */
-  float calculate_compensation(const wifi_csi_info_t* info) const;
-  
  private:
-  // Calculate median of an array (modifies array order)
-  static uint8_t calculate_median_u8(uint8_t* arr, uint16_t size);
-  static int8_t calculate_median_i8(int8_t* arr, uint16_t size);
-  
   uint16_t packet_count_{0};
   
   // Arrays to store gain values for median calculation (600 bytes total)

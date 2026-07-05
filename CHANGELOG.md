@@ -4,14 +4,160 @@ All notable changes to this project will be documented in this file.
 
 ---
 
-## [2.5.0] - in progress - ML Detector, Training Pipeline & Pre-built Firmware
+## [2.8.0] - 2026-05-21 - Detection hardening, ML cross-chip reliability, and runtime motion policy
 
 ### Highlights
 
-- **ML Detector (Experimental)**: Neural network-based motion detection — faster boot (~3s vs ~10s), no calibration needed
-- **Training Pipeline**: End-to-end workflow to collect data, train, and export models for both platforms
-- **Pre-built Firmware**: Download ready-to-flash binaries from GitHub Releases for all 6 ESP32 variants
-- **PCA Algorithm Removed**: Replaced by ML detector (see rationale below)
+- **Detection and calibration hardened across stacks**: multi-strategy NBVI band selection, Hampel on by default, stricter NBVI defaults, conservative hint-band fallback, unified 12-subcarrier defaults, and a 100-packet detection window.
+- **Runtime motion policy aligned between firmware and Micro-ESPectre**: edge-driven binary motion publish, configurable `motion_on_hits` / `motion_off_hits` (default `3` / `3`), and `evaluation_interval` decoupled from `publish_interval`.
+- **ML detector reliability improved on all chips**: datasets recollected, chip-grouped training, updated 9-feature model (`9 -> 32 -> 16 -> 1`), Hampel-aligned weights, raw-std features for ML, and a more gradual temperature-scaled Movement Score for Home Assistant.
+- **Traffic generator defaults to `ping`**: ICMP ping replaces DNS as the default CSI traffic source on both ESPHome and Micro-ESPectre (`dns` remains available).
+
+### Detection and calibration
+
+- **Traffic generator default is `ping`**: improves compatibility with routers that ignore or rate-limit root-domain DNS queries.
+- **Hampel enabled by default** (`hampel_enabled=true`, threshold `5.0` MAD).
+- **NBVI selects the lowest-FP band among four strategies** per window (Entropy Spaced, MAD Clustered, Classic Spaced, Classic Clustered); scoring exposes `nbvi_classic`, `nbvi_entropy`, and `nbvi_mad`.
+- **NBVI defaults tightened**: `alpha` `0.75`, `percentile` `5`, `noise_gate_percentile` `15`; calibration FP uses the runtime adaptive threshold (`P95 x 1.1`).
+- **Hint-band fallback is more conservative**: keeps the current/default band when both candidates already meet the `<=5%` FP target and the hint is not meaningfully worse.
+- **Default detection window is 100 packets** (`DETECTOR_DEFAULT_WINDOW_SIZE` / `SEG_WINDOW_SIZE`).
+- **Motion state is edge-driven and filterable**: binary `IDLE <-> MOTION` transitions publish immediately; `motion_on_hits` / `motion_off_hits` apply consecutive-hit filtering to both MVS and ML (default `3` / `3`).
+- **`evaluation_interval` decoupled from `publish_interval`**: detector evaluation defaults to every `25` packets; metric/log publishing keeps its own cadence.
+- **Micro-ESPectre runtime matches firmware policy**: same evaluation/hit filtering before MQTT publish; `info` reports the new knobs; `./me deploy` ships `runtime_policy.py`.
+- **Micro-ESPectre per-packet overhead reduced** for ML and MVS on device.
+
+### ML detector
+
+- **ML uses raw turbulence std, not CV normalization**: fixes ESP32 feature-scale mismatch with gain-locked chips; CV normalization remains MVS-only.
+- **Movement Score is more gradual for Home Assistant**: temperature scaling before sigmoid; default threshold `5.0` unchanged for binary detection.
+- **Production model refreshed**: 9 inputs (`turb_mean`, `turb_std`, `turb_max`, `turb_min`, `turb_iqr`, `turb_skewness`, `turb_autocorr`, `turb_mad`, `waveform_length`); topology `9 -> 32 -> 16 -> 1`; weights retrained on Hampel-filtered input.
+- **Training pipeline hardened**: `StratifiedGroupKFold` by chip, stratified internal validation, hard-positive mining for near-threshold motion.
+- **Per-chip datasets recollected** under stricter quality controls (gain-locked, 128 SC HT20, balanced baseline/motion); used for NBVI validation, MVS tests, and ML training.
+
+### Added
+
+- **`examples/espectre-s3-touch-lcd.yaml`**: Waveshare-compatible ESP32-S3 Touch LCD 1.47" profile with on-device motion status.
+- **`./me detect`**: live host-side ML inference from the UDP CSI stream (replaces `tools/12_test_motion_stream.py`).
+- **CSI research notebooks**: `micro-espectre/notebooks/01_csi_data_explorer.ipynb`, `02_feature_extraction_and_ml.ipynb`.
+
+### Changed
+
+- **ESPHome baseline `2026.5.0`**; examples/QEMU now require `min_version: 2026.5.0`.
+- **Docs and config templates**: `ping` default traffic generator; `./me detect` documented alongside `stream` and `collect`.
+- **Removed `examples/uart/`**; optional `hardware_uart: UART0` documented for USB-UART bridge setups.
+
+### Fixed
+
+- **Cross-stack real-data test pairing**: C++ harness matches Python by using full ISO timestamps with fractional seconds.
+- **Micro-ESPectre collector and dataset QA**: monotonic packet drain during interactive collect; consistent pair-ratio rounding in quality reports.
+- **Code scanning and collect tooling**: addressed reported alerts; safer temp files, UDP bind handling, and `--bind-ip` on `./me collect`.
+
+### CI and project maintenance
+
+- **DCO commit-signoff enforcement** and **CodeQL** workflow for C++ and Python.
+- **QEMU smoke tests stabilized**: PHY emulator limits handled, ESP32 coverage restored, unsupported C6 matrix entries removed.
+- **Workflow permissions and Dependabot grouping** tuned to reduce noise.
+
+---
+
+## [2.7.0] - 2026-03-17 - ESPectre configuration over BLE and subcarrier normalization
+
+### Highlights
+
+- **BLE control unlocks standalone integrations**: ESPectre can now be used even without Home Assistant by building custom BLE clients.
+- **Runtime threshold is now configurable via BLE**: the current BLE command channel enables live threshold updates and can be extended to additional runtime parameters.
+- **Web game moved from Serial to Web Bluetooth**: `docs/game` is now an example BLE client instead of a Web Serial-only path.
+- **CSI normalization supports more payload variants**: runtime handling now covers `256->128`, `228->114`, and `114->128` remap paths before HT20 processing.
+- **Behavior and validation are aligned across stacks**: ESPHome/C++ and Micro-ESPectre/Python follow the same CSI-length normalization logic, with dedicated tests for `128/256/114/228`.
+
+### Fixed
+
+- **Extended CSI normalization paths (ESPHome/C++ and Micro-ESPectre/Python)**: runtime now consistently handles `256->128` (double HT-LTF), `228->114`, and `114->128` remap paths before HT20 processing, reducing packet drops on short/double CSI payload variants (#93).
+- **Cross-stack alignment for CSI length handling**: Micro-ESPectre normalization behavior and runtime logs are now aligned with ESPHome component behavior.
+
+### Added
+
+- **Unit tests for new CSI payload scenarios**: added coverage for `114-byte` and `228-byte` CSI handling in C++ (`test_csi_manager`) and dedicated Python tests for `128/256/114/228` normalization paths (`micro-espectre/tests/test_utils.py`).
+
+### Changed
+
+- **Web game transport migrated to BLE**: `docs/game` now uses Web Bluetooth (desktop Chrome/Edge) with a custom ESPectre BLE service for telemetry (`movement`, `threshold`) and sysinfo notifications, replacing the previous Web Serial path.
+- **BLE control channel opened to generic clients**: `docs/game` is now an example client built with the Web Bluetooth API, but ESPectre can be controlled by any standard BLE client implementing the same commands.
+- **Legacy USB serial monitor path removed from firmware loop**: USB Serial/JTAG attach detection for game sysinfo emission has been cleaned up as it is no longer needed with BLE transport.
+- **Practical BLE benefits documented in this release**: the game/channel flow is now compatible with standard ESP32 boards (no native USB serial/JTAG required), does not require an active wired serial connection, and enables runtime threshold tuning over BLE from any compatible BLE client (not only `docs/game`).
+
+---
+
+## [2.6.0] - 2026-03-08 - ESP32-C5 Support, Context-Aware Calibration, and Stricter Validation Targets
+
+### Highlights
+
+- **More robust runtime on modern chips (ESP32-C5/C6)**: WiFi lifecycle handling is hardened, dual-band protocol/bandwidth APIs are used correctly (with safe fallback), C5 is forced to 2.4 GHz, and C5 CSI `114-byte` payloads are normalized to HT20 `128-byte` internal layout
+- **Safer calibration and detector state transitions**: calibration start failures are now handled explicitly, detector buffers are cold-cleared after calibration/channel switches, and NBVI input/band-size validation is hardened
+- **Stricter quality bar for motion validation**: Python and C++ performance targets are now unified to `Recall >95%` and `FP <5%` for both MVS and ML, with docs updated accordingly (`PERFORMANCE.md`, `test/README.md`)
+
+### Reliability and Runtime Fixes
+
+- **Threshold handling unified across stacks**: validation is aligned to `0.0-10.0` across ESPHome/C++ and Micro-ESPectre/Python (HA number, Serial, MQTT, detector setters); MQTT now propagates detector rejection correctly; `factory_reset` restores ML threshold to `5.0`
+- **Serial command parsing hardening**: `T:<value>` now uses validated `strtof` parsing (`endptr`, finite/range checks)
+- **Startup fail-fast behavior**: setup now marks the component failed when WiFi initialization/handler registration fails
+- **Auxiliary task stability**: DNS task always clears `running_` on early exits, avoiding stale "already running" states
+- **Safety guards in diagnostics utilities**: progress-bar width/marker bounds are now clamped to prevent fixed-buffer edge cases
+
+### Calibration, ML, and Dataset Pipeline
+
+- **NBVI hot-path optimization**: reduced allocations, enforced memory-bounded chunked validation reads (avoids `std::bad_alloc`/`abort()` on low-heap targets), and replaced O(window) shifts with ring buffer + running statistics
+- **Context-aware grid-search metadata workflow**: `micro-espectre/tools/11_refresh_gridsearch_metadata.py` introduced and then simplified to a single C++-aligned evaluation path (legacy hardcoded subcarrier override removed)
+- **Metadata consistency cleanup**: `gain_locked` is now the single source of truth in `.npz` and `dataset_info.json`; deprecated `use_cv_normalization` and `label_id` metadata removed
+- **ML pipeline alignment (training + inference)**: both stacks now use `[12, 14, 16, 18, 20, 24, 28, 36, 40, 44, 48, 52]`; models were retrained/re-exported with validated seed, and feature extraction was simplified to the selected 12 runtime features
+
+### Tooling and Developer Experience
+
+- **Micro-ESPectre deploy diagnostics improved**: `./me deploy` now performs a REPL health-check and reports explicit remediation for ROM boot-loop (`invalid header`) with `./me flash --erase`
+- **C5 support in `me` CLI expanded**: C5 auto/manual selection, `--chip c5`, correct `esp32c5` target mapping, and C5 firmware artifact selection (`ESP32_CSI_C5.bin`)
+- **Flash mapping hardening**: per-chip offsets aligned with MicroPython board deploy options (including C5 `0x2000`)
+- **Optional BSSID lock in Micro-ESPectre**: `WIFI_BSSID` support added in `src/main.py`
+- **ESP-IDF mock alignment**: WiFi mock headers updated to modern protocol bitmasks, band-mode enums, and dual-band API signatures
+- **General cleanup**: removed unused `BaseDetector` amplitude getters and refreshed stale comments/documentation (including C5 tested status in setup/examples, S2 still experimental)
+- **ESPHome 2026.2.4 validation**: project configuration was re-validated after upgrading ESPHome from `2026.2.0` to `2026.2.4` (`esphome config examples/espectre-c6-dev.yaml`), with full Python and C++ test suites passing
+
+---
+
+## [2.5.1] - 2026-02-23 - HT STBC Multi-Antenna Router Fix
+
+### Fixed
+
+- **ESP32-C5/C6 STBC multi-antenna router fix**: Multi-antenna routers with STBC TX send two HT training fields per frame (HT-LTF1 + HT-LTF2), causing the CSI callback to receive 256-byte packets instead of the expected 128 bytes for HT20. On ESP32-C5/C6, `wifi_csi_acquire_config_t` has no field to disable HT STBC capture (unlike older chips). ESPectre now accepts these packets and takes the first 64 subcarriers (HT-LTF1), which is a valid channel estimate (#76, espressif/esp-csi#238)
+- **Micro-ESPectre NBVI calibration on ESP32-C3**: Fixed OOM crashes during calibration caused by large in-memory allocations in the streaming NBVI computation phase; calibration now completes successfully on C3 with ~59 KB free heap
+- **ESPHome 2026.2.0+ compatibility**: Ensure SPIFFS inclusion for newer ESPHome versions (#87)
+- **CI develop branch**: Use local component configs instead of main branch for CI builds on develop
+
+### Changed
+
+- **Micro-ESPectre NBVI calibration speed**: Packet collection rate improved ~3x on ESP32-C3 (28 → 80 pps) by skipping sqrt on guard band subcarriers (excluded from NBVI selection), caching `math.sqrt` locally, and using integer arithmetic in the magnitude loop
+
+### Added
+
+- **Performance documentation**: RAM, Flash, and detection timing benchmarks for ESP32-C3 and ESP32-C6 in PERFORMANCE.md
+- **Performance logging**: Lightweight DEBUG-level logging for heap usage (startup/post-calibration) and detection time (~10s interval)
+- **git_ref substitution**: All example YAML files now use a `git_ref` substitution, making it easy to switch between branches, tags, or commits
+- **Snapshot builds**: Automated pre-release builds on every push to main, providing pre-compiled firmware for testing fixes before official releases
+
+### Documentation
+
+- Clarify that NBVI calibration applies only to MVS mode
+- Add media section in README
+
+---
+
+## [2.5.0] - 2026-02-15 - ML Detector, Training Pipeline & Pre-built Firmware
+
+### Highlights
+
+- **ML Detector (Experimental)**: Neural network-based motion detection with ~3s boot time (no calibration needed)
+- **Training Pipeline**: Collect data, train, and export models for both platforms
+- **Pre-built Firmware**: Ready-to-flash binaries for all 6 ESP32 variants via GitHub Releases
+- **PCA & P95 Removed**: Simplified to MVS + ML detectors, NBVI-only calibration
 
 ### ML Detector
 
@@ -29,7 +175,7 @@ espectre:
 
 The pre-trained model shipped with this release was trained on a limited dataset collected in a single environment. It performs well in initial testing, but **we need your help to make it better**. If you try the ML detector, consider contributing baseline (empty room) and movement recordings from your environment — the more diverse the training data, the more robust the model becomes. See [ML_DATA_COLLECTION.md](micro-espectre/ML_DATA_COLLECTION.md) for how to collect and submit data via pull request.
 
-For architecture and feature details, see [ALGORITHMS.md](micro-espectre/ALGORITHMS.md#csi-features-for-ml).
+For architecture and feature details, see [ALGORITHMS.md](micro-espectre/ALGORITHMS.md#ml-neural-network-detector).
 
 #### Training Pipeline
 
@@ -53,27 +199,40 @@ SETUP.md now offers two installation paths:
 
 Based on PR #77 by [@WLaoDuo](https://github.com/WLaoDuo).
 
-### PCA Detection Algorithm Removed
+### Removed
 
-The PCA (Principal Component Analysis) detection algorithm has been removed from ESPectre. While PCA itself is a well-known statistical technique, our implementation was based on Espressif's open-source esp-radar library. Since Espressif has transitioned this library to closed source, we have removed our PCA implementation to ensure full compliance with our GPLv3 license.
+**PCA Detection Algorithm**: While PCA itself is a well-known statistical technique, our implementation was based on Espressif's open-source esp-radar library. Since Espressif has transitioned this library to closed source, we have removed our PCA implementation to ensure full compliance with our GPLv3 license.
 
-MVS remains the recommended algorithm with excellent performance (F1 > 99%). Future development will focus on the ML detector, which shows very promising results in early testing and requires no initial calibration.
+MVS remains the recommended algorithm with excellent performance. Future development will focus on the ML detector, which shows very promising results in early testing and requires no initial calibration.
+
+**P95 Calibrator**: NBVI (Normalized Band Variance Index) is now the sole calibration algorithm. NBVI consistently outperforms P95 by selecting non-consecutive subcarriers for better spectral diversity and resilience to narrowband interference.
 
 ### Improvements
 
-- **Gain lock**: Median-based calibration (replaces mean), signed FFT gain fix, new gain compensation for when gain lock is skipped
-- **Calibrator refactoring**: New `BaseCalibrator` and `CalibrationFileBuffer` abstractions, ~200 lines of duplication removed
-- **Bug fixes**: Double amplitude calculation fix, stack allocation in Hampel filter, emoji removal from serial logs
+- **Gain lock**: Median-based calibration (replaces mean), signed FFT gain fix, CV normalization when gain lock is skipped
+- **Bug fixes**: Double amplitude calculation fix, stack allocation in Hampel filter
 
 ### Micro-ESPectre (R&D Platform)
 
 - **Extended hardware support**: `me` CLI now supports ESP32, C3, S3, C6 with auto-detection and SHA256 firmware verification
-- **Gain compensation**: All detectors (MVS, ML) now apply gain compensation consistently
 - **ML detector filter support**: ML detector now accepts low-pass and Hampel filter parameters, matching C++ implementation
-- **DRY refactoring**: Extracted `BaseCalibrator` from `ICalibrator` to eliminate duplicated buffer management in `P95Calibrator` and `NBVICalibrator`; shared `insertion_sort` moved to `utils.py`; state constants unified via `MotionState`; variance calculation delegated to shared utility
 - **Import standardization**: All `src/` modules now use `try/except ImportError` pattern for MicroPython/CPython compatibility
-- **Removed `BandCalibrator` alias**: Unused alias for `P95Calibrator` cleaned up
-- **Bug fixes**: Signed int8 CSI parsing, ESP32 flash offset corrected, LowPass default cutoff aligned to 11.0 Hz, "Wi-Fi spectre" typo corrected to "Wi-Fi spectrum"
+- **Bug fixes**: Signed int8 CSI parsing, ESP32 flash offset corrected, LowPass default cutoff aligned to 11.0 Hz
+
+### For Contributors
+
+<details>
+<summary>Architecture changes and internal improvements</summary>
+
+#### Architecture
+
+- **Calibrator simplification**: Removed `ICalibrator` interface and `BaseCalibrator` base class, merging all functionality into `NBVICalibrator`
+- **Window size centralization**: `segmentation_window_size` (default: 75) is now defined in a single source of truth (`DETECTOR_DEFAULT_WINDOW_SIZE` in C++, `SEG_WINDOW_SIZE` in Python) and passed to both detector and calibrator
+- **Calibration buffer size**: Now calculated as `10 × window_size` (default: 750 packets), automatically adapts if window size changes
+- **CV normalization**: Both platforms use CV normalization consistently when gain lock is skipped
+- **Unified window size in tools**: All analysis tools now use `SEG_WINDOW_SIZE` from `config.py` instead of hardcoded values
+
+</details>
 
 ---
 
@@ -107,7 +266,7 @@ New Home Assistant switch for triggering recalibration without reflashing:
 
 The `segmentation_threshold` parameter is now optional:
 
-- **Default**: Adaptive threshold calculated as P95 × 1.4 during calibration
+- **Default**: Adaptive threshold calculated as P95 × 1.1 during calibration
 - **Manual override**: Specify value in YAML to use fixed threshold
 
 ### Improvements
@@ -282,7 +441,7 @@ See [espressif/esp-csi#247](https://github.com/espressif/esp-csi/issues/247).
 
 Automatic gain control locking for stable CSI measurements, based on [Espressif esp-csi](https://github.com/espressif/esp-csi) recommendations.
 
-- **Two-phase calibration**: Gain Lock (3s, 300 pkt) → NBVI (7s, 700 pkt)
+- **Two-phase calibration**: Gain Lock (3s, 300 pkt) → NBVI (~7.5s, 10 × window_size pkt)
 - Gain lock happens BEFORE NBVI calibration to ensure clean data
 - Eliminates amplitude variations caused by automatic gain control
 - Supported on ESP32-S3, C3, C5, C6 (not available on ESP32, S2)

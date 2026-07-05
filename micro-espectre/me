@@ -5,21 +5,23 @@ import json
 import time
 import argparse
 import shlex
+import signal
 import webbrowser
 import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
-FIRMWARE_RELEASE_URL = "https://github.com/francescopace/micropython-esp32-csi/releases/download/v1.0.0-rc5"
+FIRMWARE_RELEASE_URL = "https://github.com/francescopace/micropython-esp32-csi/releases/download/v1.0.0-rc7"
 FIRMWARE_NAME_PREFIX = "ESP32_CSI_"
 
 # SHA256 hashes for firmware verification (update when releasing new firmware)
 FIRMWARE_HASHES = {
-    'ESP32_CSI.bin': '63fd7a86ae154578af1837ce73304acd5ce06dc1184fafa4e2d5f68f7cc7c102',
-    'ESP32_CSI_C3.bin': 'a945ca2dac7cec68bc6ac6bb1c2ea437e0cb80a414c1fe326c57edb8e34856af',
-    'ESP32_CSI_C6.bin': '4518643087bed995b91e9f904bcccb28875c35a2e1b93f47892704145395ef16',
-    'ESP32_CSI_S3.bin': '3e44a7556b2fb0b0268acec533e26cce52ff027668f195e55287ad42f76c4ae4',
+    'ESP32_CSI.bin': '632e9898f283dfe473bc75d14e40c9b6802f7997cbab600be3502fe6dc5a5651',
+    'ESP32_CSI_C3.bin': '5613e2fdfb1541b1b2ad20e5ac424f8ffaa363f7b44d2121cf33ff9548d16c98',
+    'ESP32_CSI_C5.bin': '66a9a9a16fb67baa248167f6928e63b12b3010780476c23ea1e78d30b3851f0d',
+    'ESP32_CSI_C6.bin': '1f29e11c82cce53da1a47d5b930bedc4446b477d5819fc7916c70d1295438b77',
+    'ESP32_CSI_S3.bin': 'e4a07da0b079425b642fe80311b56731a9ea8a0165e67d1df090a051e43553ee'
 }
 
 try:
@@ -119,7 +121,7 @@ def get_serial_port(port_arg):
 
 
 def detect_chip_type(port):
-    """Auto-detect ESP32 chip type (ESP32, C3, S3, or C6)"""
+    """Auto-detect ESP32 chip type (ESP32, C3, S3, C5, or C6)"""
     try:
         import esptool
     except ImportError:
@@ -146,6 +148,9 @@ def detect_chip_type(port):
         elif 'ESP32-C6' in chip_name:
             print(f"{Fore.GREEN}✅ Detected: ESP32-C6{Style.RESET_ALL}\n")
             return 'c6'
+        elif 'ESP32-C5' in chip_name:
+            print(f"{Fore.GREEN}✅ Detected: ESP32-C5{Style.RESET_ALL}\n")
+            return 'c5'
         elif 'ESP32-C3' in chip_name:
             print(f"{Fore.GREEN}✅ Detected: ESP32-C3{Style.RESET_ALL}\n")
             return 'c3'
@@ -176,11 +181,12 @@ def prompt_chip_type():
     print(f"  1. ESP32 (original)")
     print(f"  2. ESP32-C3")
     print(f"  3. ESP32-S3")
-    print(f"  4. ESP32-C6")
+    print(f"  4. ESP32-C5")
+    print(f"  5. ESP32-C6")
     print()
     
     try:
-        choice = input(f"{Fore.CYAN}Select chip (1-4): {Style.RESET_ALL}")
+        choice = input(f"{Fore.CYAN}Select chip (1-5): {Style.RESET_ALL}")
         if choice == '1':
             print(f"{Fore.GREEN}✅ Selected: ESP32{Style.RESET_ALL}\n")
             return 'esp32'
@@ -191,6 +197,9 @@ def prompt_chip_type():
             print(f"{Fore.GREEN}✅ Selected: ESP32-S3{Style.RESET_ALL}\n")
             return 's3'
         elif choice == '4':
+            print(f"{Fore.GREEN}✅ Selected: ESP32-C5{Style.RESET_ALL}\n")
+            return 'c5'
+        elif choice == '5':
             print(f"{Fore.GREEN}✅ Selected: ESP32-C6{Style.RESET_ALL}\n")
             return 'c6'
         else:
@@ -216,6 +225,7 @@ def download_firmware(chip: str, firmware_dir: Path) -> Path:
         'esp32': '',      # ESP32_CSI.bin (no suffix for original ESP32)
         'c3': 'C3',       # ESP32_CSI_C3.bin
         's3': 'S3',       # ESP32_CSI_S3.bin
+        'c5': 'C5',       # ESP32_CSI_C5.bin
         'c6': 'C6',       # ESP32_CSI_C6.bin
     }
     chip_suffix = chip_suffix_map.get(chip, chip.upper())
@@ -357,6 +367,7 @@ def flash_firmware(args):
         'esp32': 'esp32',
         'c3': 'esp32c3',
         's3': 'esp32s3',
+        'c5': 'esp32c5',
         'c6': 'esp32c6',
     }
     chip_name = chip_name_map.get(chip, 'esp32')
@@ -390,9 +401,16 @@ def flash_firmware(args):
                     print(f"{Fore.YELLOW}🔄 Retry attempt {attempt + 1}/{max_retries}...{Style.RESET_ALL}")
                     time.sleep(2)  # Wait before retry
                 
-                # Use write-flash (not deprecated) with conservative settings
-                # ESP32 base requires 0x1000 offset, newer chips (S3/C3/C6) use 0x0
-                flash_offset = '0x1000' if chip == 'esp32' else '0x0'
+                # Use write-flash (not deprecated) with conservative settings.
+                # Keep offsets aligned with MicroPython board deploy_options.
+                flash_offset_map = {
+                    'esp32': '0x1000',
+                    'c3': '0x0',
+                    's3': '0x0',
+                    'c5': '0x2000',
+                    'c6': '0x0',
+                }
+                flash_offset = flash_offset_map.get(chip, '0x0')
                 
                 flash_args = base_args + [
                     '--before', 'default-reset',  # Reset before operation
@@ -470,12 +488,29 @@ def deploy_code(args):
     print()
     
     try:
+        # Verify that MicroPython REPL is responsive before attempting file upload.
+        # If the board is in boot ROM loop (e.g. invalid flash image), mpremote copy
+        # fails with noisy serial output and unclear errors.
+        health = subprocess.run(
+            ['mpremote', 'connect', port, 'exec', 'print("MP_OK")'],
+            capture_output=True,
+            text=True
+        )
+        if health.returncode != 0 or 'MP_OK' not in (health.stdout or ''):
+            print(f"{Fore.RED}❌ Device is not running a valid MicroPython firmware{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}   Serial output suggests boot failure (e.g. invalid header).{Style.RESET_ALL}")
+            print(f"\n{Fore.CYAN}Recommended fix:{Style.RESET_ALL}")
+            print(f"  {Fore.GREEN}./me flash --erase --chip c5{Style.RESET_ALL}")
+            print(f"  {Fore.GREEN}./me deploy{Style.RESET_ALL}")
+            print()
+            sys.exit(1)
+
         # Create directories
         print(f"{Fore.YELLOW}📁 Creating directories...{Style.RESET_ALL}")
-        subprocess.run(['mpremote', 'connect', port, 'mkdir', ':src'], 
-                      stderr=subprocess.DEVNULL, check=False)
-        subprocess.run(['mpremote', 'connect', port, 'mkdir', ':src/mqtt'], 
-                      stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(['mpremote', 'connect', port, 'mkdir', ':src'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(['mpremote', 'connect', port, 'mkdir', ':src/mqtt'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         
         # Upload files
         print(f"{Fore.YELLOW}📤 Uploading files...{Style.RESET_ALL}")
@@ -490,11 +525,10 @@ def deploy_code(args):
             ('src/features.py', ':src/'),
             ('src/segmentation.py', ':src/'),
             ('src/detector_interface.py', ':src/'),
+            ('src/runtime_policy.py', ':src/'),
             ('src/mvs_detector.py', ':src/'),
             ('src/ml_detector.py', ':src/'),
             ('src/ml_weights.py', ':src/'),
-            ('src/calibrator_interface.py', ':src/'),
-            ('src/p95_calibrator.py', ':src/'),
             ('src/nbvi_calibrator.py', ':src/'),
             ('src/traffic_generator.py', ':src/'),
             ('src/main.py', ':src/'),
@@ -560,6 +594,7 @@ def stream_csi(args):
     print()
     print(f"{Fore.YELLOW}On another terminal (PC), run:{Style.RESET_ALL}")
     print(f"  ./me collect --label <name> --duration <sec>  {Fore.CYAN}# Collect labeled data{Style.RESET_ALL}")
+    print(f"  ./me detect --log-turbulence               {Fore.CYAN}# Debug live motion inference{Style.RESET_ALL}")
     print()
     
     process = None
@@ -664,7 +699,7 @@ def collect_csi_data(args):
         sys.path.insert(0, str(parent_dir))
     
     try:
-        from tools.csi_utils import CSICollector, get_dataset_stats
+        from tools.csi_utils import CSICollector, get_dataset_stats, get_default_bind_host
     except ImportError as e:
         print(f"{Fore.RED}❌ Failed to import csi_utils: {e}{Style.RESET_ALL}")
         print(f"{Fore.YELLOW}Make sure tools/csi_utils.py exists{Style.RESET_ALL}")
@@ -685,11 +720,11 @@ def collect_csi_data(args):
             print(f"    1. Start streaming on ESP32: ./me stream --ip <PC_IP>")
             print(f"    2. Collect samples: ./me collect --label wave --samples 10")
         else:
-            print(f"  {Fore.CYAN}{'Label':<20} {'Samples':>10} {'ID':>6}{Style.RESET_ALL}")
-            print(f"  {'-' * 38}")
+            print(f"  {Fore.CYAN}{'Label':<20} {'Samples':>10}{Style.RESET_ALL}")
+            print(f"  {'-' * 32}")
             for label, info in stats['labels'].items():
-                print(f"  {label:<20} {info['samples']:>10} {info['id']:>6}")
-            print(f"  {'-' * 38}")
+                print(f"  {label:<20} {info['samples']:>10}")
+            print(f"  {'-' * 32}")
             print(f"  {Fore.GREEN}{'Total':<20} {stats['total_samples']:>10}{Style.RESET_ALL}")
         print()
         return
@@ -707,30 +742,38 @@ def collect_csi_data(args):
     print(f"{Fore.MAGENTA}║           μESPectre - CSI Data Collection                 ║{Style.RESET_ALL}")
     print(f"{Fore.MAGENTA}╚═══════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
     print()
+    resolved_bind_ip = args.bind_ip if args.bind_ip else get_default_bind_host()
     print(f"  {Fore.CYAN}Label:{Style.RESET_ALL}     {args.label}")
     print(f"  {Fore.CYAN}Samples:{Style.RESET_ALL}   {args.samples}")
     print(f"  {Fore.CYAN}Duration:{Style.RESET_ALL}  {args.duration}s per sample")
+    print(f"  {Fore.CYAN}Bind IP:{Style.RESET_ALL}   {resolved_bind_ip}")
     print(f"  {Fore.CYAN}UDP Port:{Style.RESET_ALL}  {args.udp_port}")
+    if args.description:
+        print(f"  {Fore.CYAN}Description:{Style.RESET_ALL} {args.description}")
     print()
-    print(f"  {Fore.YELLOW}Chip type auto-detected from CSI stream{Style.RESET_ALL}")
+    print(f"  {Fore.YELLOW}Chip type and gain lock status auto-detected from CSI stream{Style.RESET_ALL}")
     print(f"  {Fore.YELLOW}Make sure ESP32 is streaming: ./me stream --ip <PC_IP>{Style.RESET_ALL}")
     print()
     
-    # Create collector (chip is auto-detected from CSI packets)
+    # Create collector (chip and gain_locked are auto-detected from CSI packets)
     collector = CSICollector(
         label=args.label,
         port=args.udp_port,
-        contributor=args.contributor
+        contributor=args.contributor,
+        description=args.description,
+        bind_host=resolved_bind_ip
     )
     
     try:
         if args.interactive:
-            saved = collector.collect_interactive(num_samples=args.samples)
+            saved = collector.collect_interactive(
+                num_samples=args.samples,
+                duration=args.duration
+            )
         else:
             saved = collector.collect_timed(
                 duration=args.duration,
-                num_samples=args.samples,
-                countdown=3
+                num_samples=args.samples
             )
         
         if saved:
@@ -743,6 +786,189 @@ def collect_csi_data(args):
     except Exception as e:
         print(f"\n{Fore.RED}❌ Error during collection: {e}{Style.RESET_ALL}")
         sys.exit(1)
+
+
+def detect_live_motion(args):
+    """Run live ML motion detection on PC from the UDP CSI stream."""
+    parent_dir = Path(__file__).parent
+    if str(parent_dir) not in sys.path:
+        sys.path.insert(0, str(parent_dir))
+
+    try:
+        from tools.csi_utils import CSIReceiver, get_default_bind_host
+        import src.config as config
+        from src.ml_detector import MLDetector, ML_DEFAULT_THRESHOLD, ML_METRIC_SCALE, FEATURE_NAMES
+        from src.runtime_policy import RuntimeMotionPolicy
+    except ImportError as e:
+        print(f"{Fore.RED}❌ Failed to import motion detection modules: {e}{Style.RESET_ALL}")
+        sys.exit(1)
+
+    def format_progress_bar(score, threshold, width=20):
+        threshold_pos = int((threshold / ML_METRIC_SCALE) * width) if threshold > 0 else 0
+        filled = int((score / ML_METRIC_SCALE) * width)
+        threshold_pos = max(0, min(threshold_pos, width - 1))
+        filled = max(0, min(filled, width))
+        bar = "["
+        for i in range(width):
+            if i == threshold_pos:
+                bar += "|"
+            elif i < filled:
+                bar += "#"
+            else:
+                bar += "-"
+        bar += "]"
+        percent = int((score / threshold) * 100) if threshold > 0 else 0
+        return f"{bar} {percent}%"
+
+    def format_feature_vector(features):
+        return " ".join(f"{name}={value:.4f}" for name, value in zip(FEATURE_NAMES, features))
+
+    def get_ordered_turbulence_tail(ctx, tail_size):
+        if ctx.buffer_count <= 0 or tail_size <= 0:
+            return []
+        if ctx.buffer_count < ctx.window_size:
+            ordered = ctx.turbulence_buffer[:ctx.buffer_count]
+        else:
+            idx = ctx.buffer_index
+            ordered = ctx.turbulence_buffer[idx:] + ctx.turbulence_buffer[:idx]
+        return ordered[-tail_size:]
+
+    def format_turbulence_tail(values):
+        return " ".join(f"{value:.4f}" for value in values)
+
+    def get_runtime_subcarriers():
+        selected = getattr(config, "SELECTED_SUBCARRIERS", None)
+        if selected:
+            return list(selected)
+        return list(config.DEFAULT_SUBCARRIERS)
+
+    def get_runtime_ml_threshold():
+        threshold = getattr(config, "SEG_THRESHOLD", ML_DEFAULT_THRESHOLD)
+        if isinstance(threshold, (int, float)):
+            return float(threshold)
+        return ML_DEFAULT_THRESHOLD
+
+    resolved_bind_ip = args.bind_ip if args.bind_ip else get_default_bind_host()
+    subcarriers = get_runtime_subcarriers()
+    threshold = get_runtime_ml_threshold()
+    detector = MLDetector(
+        window_size=config.SEG_WINDOW_SIZE,
+        threshold=threshold,
+        enable_lowpass=config.ENABLE_LOWPASS_FILTER,
+        lowpass_cutoff=config.LOWPASS_CUTOFF,
+        enable_hampel=config.ENABLE_HAMPEL_FILTER,
+        hampel_window=config.HAMPEL_WINDOW,
+        hampel_threshold=config.HAMPEL_THRESHOLD,
+    )
+    runtime_policy = RuntimeMotionPolicy(
+        evaluation_interval=getattr(config, "EVALUATION_INTERVAL", 25),
+        motion_on_hits=getattr(config, "MOTION_ON_HITS", 3),
+        motion_off_hits=getattr(config, "MOTION_OFF_HITS", 3),
+    )
+    publish_rate = getattr(config, "PUBLISH_INTERVAL", 100) or 100
+    receiver = CSIReceiver(
+        port=args.udp_port,
+        buffer_size=4000,
+        bind_host=resolved_bind_ip,
+    )
+
+    state = {
+        "running": True,
+        "packet_count": 0,
+        "publish_counter": 0,
+    }
+
+    def should_log_publish(effective_state):
+        if not args.log_only_motion:
+            return True
+        return effective_state == 1
+
+    def handle_sigint(_signum, _frame):
+        state["running"] = False
+        receiver.stop()
+
+    def on_packet(pkt):
+        if not state["running"]:
+            return
+
+        state["packet_count"] += 1
+        state["publish_counter"] += 1
+
+        if args.log_turbulence:
+            raw_turbulence = detector._context._compute_spatial_turbulence_in_buffer(
+                pkt.iq_raw, subcarriers
+            )
+        else:
+            raw_turbulence = None
+        detector.process_packet(pkt.iq_raw, subcarriers)
+        filtered_turbulence = detector._context.last_turbulence
+        runtime_policy.note_packet()
+
+        should_publish = state["publish_counter"] >= publish_rate
+        if not runtime_policy.should_evaluate(should_publish):
+            return
+
+        metrics = detector.update_state()
+        effective_state, _ = runtime_policy.apply_state(metrics["state"])
+        runtime_policy.after_evaluation()
+
+        if should_publish:
+            motion_metric = metrics.get("probability", 0.0)
+            metric_threshold = metrics["threshold"]
+            progress_bar = format_progress_bar(motion_metric, metric_threshold)
+            state_str = "MOTION" if effective_state == 1 else "IDLE"
+
+            if should_log_publish(effective_state):
+                print(
+                    f"{progress_bar} | mvmt:{motion_metric:.4f} thr:{metric_threshold:.4f} | "
+                    f"{state_str} | pkt:{state['packet_count']} drop:{receiver.dropped_count} "
+                    f"pps:{receiver.pps}"
+                )
+                if args.log_turbulence:
+                    window_tail = get_ordered_turbulence_tail(detector._context, args.window_tail)
+                    print(
+                        f"  turbulence: raw={raw_turbulence:.4f} "
+                        f"filtered={filtered_turbulence:.4f}"
+                    )
+                    if window_tail:
+                        print(f"  tail[{len(window_tail)}]: {format_turbulence_tail(window_tail)}")
+                if args.log_features and detector.is_ready():
+                    features = detector._extract_features()
+                    print(f"  features: {format_feature_vector(features)}")
+
+            state["publish_counter"] = 0
+
+    receiver.add_callback(on_packet)
+    signal.signal(signal.SIGINT, handle_sigint)
+
+    print(f"\n{Fore.MAGENTA}╔═══════════════════════════════════════════════════════════╗{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}║        μESPectre - Live Motion Detection                  ║{Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}╚═══════════════════════════════════════════════════════════╝{Style.RESET_ALL}")
+    print()
+    print(f"  {Fore.CYAN}Bind IP:{Style.RESET_ALL}   {resolved_bind_ip}")
+    print(f"  {Fore.CYAN}UDP Port:{Style.RESET_ALL}  {args.udp_port}")
+    print(f"  {Fore.CYAN}Threshold:{Style.RESET_ALL} {threshold:.1f}")
+    print(f"  {Fore.CYAN}Window:{Style.RESET_ALL}    {config.SEG_WINDOW_SIZE} pkts")
+    print(f"  {Fore.CYAN}Subcarriers:{Style.RESET_ALL} {subcarriers}")
+    print(f"  {Fore.CYAN}Hits on/off:{Style.RESET_ALL} {getattr(config, 'MOTION_ON_HITS', 3)}/{getattr(config, 'MOTION_OFF_HITS', 3)}")
+    print(f"  {Fore.CYAN}Low-pass:{Style.RESET_ALL}  {'ON' if config.ENABLE_LOWPASS_FILTER else 'OFF'}")
+    print(f"  {Fore.CYAN}Hampel:{Style.RESET_ALL}    {'ON' if config.ENABLE_HAMPEL_FILTER else 'OFF'}")
+    print()
+    print(f"  {Fore.YELLOW}Make sure ESP32 is streaming: ./me stream --ip <PC_IP>{Style.RESET_ALL}")
+    print(f"  {Fore.YELLOW}Press Ctrl+C to stop{Style.RESET_ALL}")
+    print()
+
+    try:
+        while state["running"]:
+            receiver.run(timeout=1.0, quiet=True)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        print(f"\n{Fore.RED}❌ Error during live detection: {e}{Style.RESET_ALL}")
+        sys.exit(1)
+    finally:
+        receiver.stop()
+        print(f"\n{Fore.GREEN}Done.{Style.RESET_ALL}\n")
 
 
 def verify_installation(args):
@@ -905,6 +1131,9 @@ Examples:
   ./me collect --label wave --samples 30
   ./me collect --info
   
+  # Run live motion detection on PC from CSI stream
+  ./me detect --log-turbulence
+  
   # Verify installation
   ./me verify
   
@@ -918,7 +1147,7 @@ Examples:
     
     # Flash command
     flash_parser = subparsers.add_parser('flash', help='Flash MicroPython firmware to ESP32')
-    flash_parser.add_argument('--chip', choices=['esp32', 'c3', 's3', 'c6'],
+    flash_parser.add_argument('--chip', choices=['esp32', 'c3', 's3', 'c5', 'c6'],
                              help='ESP32 chip type (auto-detected if not specified)')
     flash_parser.add_argument('--port',
                              help='Serial port (auto-detected if not specified)')
@@ -959,16 +1188,35 @@ Examples:
                                help='Label for collected data (e.g., wave, baseline, idle)')
     collect_parser.add_argument('--samples', '-n', type=int, default=1,
                                help='Number of samples to collect (default: 1)')
-    collect_parser.add_argument('--duration', '-d', type=float, default=3.0,
-                               help='Duration per sample in seconds (default: 3.0)')
+    collect_parser.add_argument('--duration', '-d', type=float, default=2.0,
+                               help='Duration per sample in seconds (default: 2.0)')
     collect_parser.add_argument('--info', '-i', action='store_true',
                                help='Show dataset statistics')
     collect_parser.add_argument('--interactive', action='store_true',
                                help='Interactive mode (press ENTER for each sample)')
     collect_parser.add_argument('--udp-port', type=int, default=5001,
                                help='UDP port for CSI reception (default: 5001)')
+    collect_parser.add_argument('--bind-ip', default=None,
+                               help='Local IP/interface for UDP bind (default: auto-detect)')
     collect_parser.add_argument('--contributor', '-c',
                                help='GitHub username of the contributor')
+    collect_parser.add_argument('--description', 
+                               help='Description for the collected samples')
+
+    # Detect command (runs on PC, receives UDP from ESP32)
+    detect_parser = subparsers.add_parser('detect', help='Run live ML motion detection from CSI UDP stream')
+    detect_parser.add_argument('--udp-port', type=int, default=5001,
+                              help='UDP port for CSI reception (default: 5001)')
+    detect_parser.add_argument('--bind-ip', default=None,
+                              help='Local IP/interface for UDP bind (default: auto-detect)')
+    detect_parser.add_argument('--log-features', action='store_true',
+                              help='Print the 9 ML features after each published sample')
+    detect_parser.add_argument('--log-turbulence', action='store_true',
+                              help='Print raw/filtered turbulence and recent buffer tail after each publish')
+    detect_parser.add_argument('--log-only-motion', action='store_true',
+                              help='Only print publish lines when the effective state is MOTION')
+    detect_parser.add_argument('--window-tail', type=int, default=16,
+                              help='Number of latest turbulence samples to print with --log-turbulence')
     
     # MQTT interactive mode arguments (when no subcommand)
     parser.add_argument("--broker", default=os.getenv("MQTT_BROKER", "homeassistant.local"),
@@ -997,6 +1245,8 @@ Examples:
         verify_installation(args)
     elif args.command == 'collect':
         collect_csi_data(args)
+    elif args.command == 'detect':
+        detect_live_motion(args)
     elif args.command == 'ui':
         open_web_ui()
     else:

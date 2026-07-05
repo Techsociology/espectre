@@ -22,20 +22,21 @@ pio test -f test_motion_detection
 | Suite | Type | Data | Focus |
 |-------|------|------|-------|
 | `test_mvs_detector` | Unit | **Real** | MVS algorithm, threshold, filters, state machine, lowpass |
+| `test_ml_detector` | Unit | **Real** | ML detector, feature extraction, inference |
 | `test_csi_manager` | Unit | Synthetic | CSIManager API, enable/disable, callbacks |
 | `test_utils` | Unit | **Real** | Variance, magnitude, turbulence, compare functions |
 | `test_hampel_filter` | Unit | **Real** | Outlier removal filter |
-| `test_p95_calibrator` | Unit | **Real** | P95 band selection, magnitude, turbulence, adaptive threshold |
 | `test_nbvi_calibrator` | Unit | **Real** | NBVI subcarrier selection, configuration |
 | `test_calibration_file_storage` | Unit | Synthetic | File-based magnitude storage |
 | `test_traffic_generator` | Unit | Synthetic | Error handling, rate limiting, adaptive backoff |
-| `test_serial_streamer` | Unit | Synthetic | Serial streaming API |
-| `test_motion_detection` | Integration | **Real** | MVS performance, P95 calibration end-to-end |
+| `test_motion_detection` | Integration | **Real** | MVS/ML performance, NBVI calibration end-to-end |
 
 
 ### Target Metrics (Motion Detection)
-- **Recall**: ≥95% (detect real movements)
-- **FP Rate**: <1% (avoid false alarms)
+- **Recall**: >95% for all chips (detect real movements)
+- **FP Rate**: <5% for all chips (avoid false alarms)
+
+See [PERFORMANCE.md](../PERFORMANCE.md) for detailed targets per chip and algorithm.
 
 ---
 
@@ -45,12 +46,14 @@ Tests load real CSI data from NPZ files in `micro-espectre/data/` using the [cnp
 
 ### Datasets
 
-| Chip | Baseline | Movement | Packets |
-|------|----------|----------|---------|
-| ESP32-C6 | `baseline_c6_64sc_*.npz` | `movement_c6_64sc_*.npz` | 1000 each |
-| ESP32-S3 | `baseline_s3_64sc_*.npz` | `movement_s3_64sc_*.npz` | 1000 each |
+| Chip | Baseline | Movement |
+|------|----------|----------|
+| ESP32-C3 | `baseline_c3_64sc_*.npz` | `movement_c3_64sc_*.npz` |
+| ESP32-C6 | `baseline_c6_64sc_*.npz` | `movement_c6_64sc_*.npz` |
+| ESP32-S3 | `baseline_s3_64sc_*.npz` | `movement_s3_64sc_*.npz` |
+| ESP32 | `baseline_esp32_64sc_*.npz` | `movement_esp32_64sc_*.npz` |
 
-Tests run with **multiple chip datasets** (C6, S3) using 64 SC (HT20 mode).
+Tests run with **multiple chip datasets** (C3, C6, S3, ESP32) using 64 SC (HT20 mode).
 
 Both Python and C++ tests use the same NPZ files, eliminating duplication.
 
@@ -73,7 +76,7 @@ test/
 ├── mocks/              # Mock implementations
 │   ├── esp_idf/        # ESP-IDF mocks (native only)
 │   └── esphome/        # ESPHome mocks (native only)
-├── data/               # Real CSI test data
+├── data/               # CSI test data loader (cnpy library)
 ├── test/               # Test suites (one folder per suite)
 ├── platformio.ini      # PlatformIO configuration
 └── run_coverage.sh     # Coverage script
@@ -106,11 +109,11 @@ act -j build --matrix chip:"QEMU ESP32-C3" -P ubuntu-latest=catthehacker/ubuntu:
 
 | Chip | Architecture | QEMU Machine |
 |------|--------------|--------------|
+| ESP32 | Xtensa | esp32 |
 | ESP32-S3 | Xtensa | esp32s3 |
 | ESP32-C3 | RISC-V | esp32c3 |
-| ESP32-C6 | RISC-V | esp32c6 |
 
-> Note: ESP32 original is excluded - QEMU doesn't emulate PHY registers correctly, causing false crashes.
+> Note: WiFi PHY is not fully emulated by QEMU. The CI smoke test filters the known PHY assert so boot regressions still surface without failing on emulator limitations.
 
 > **Note**: Smoke tests appear as "Smoke Test ESP32-C3" etc. in CI.
 

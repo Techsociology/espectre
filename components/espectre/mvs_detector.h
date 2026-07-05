@@ -25,7 +25,8 @@ namespace espectre {
 
 // MVS-specific constants
 constexpr float MVS_DEFAULT_THRESHOLD = 1.0f;
-constexpr float MVS_MIN_THRESHOLD = 0.1f;
+// Min threshold allows full 0.0-10.0 range for UI parity and CV-normalized setups.
+constexpr float MVS_MIN_THRESHOLD = 0.0f;
 constexpr float MVS_MAX_THRESHOLD = 10.0f;
 
 /**
@@ -40,7 +41,7 @@ public:
      * Constructor
      * 
      * @param window_size Moving variance window size (10-200 packets)
-     * @param threshold Motion detection threshold (0.1-10.0)
+     * @param threshold Motion detection threshold (0.0-10.0)
      */
     MVSDetector(uint16_t window_size = DETECTOR_DEFAULT_WINDOW_SIZE, 
                 float threshold = MVS_DEFAULT_THRESHOLD);

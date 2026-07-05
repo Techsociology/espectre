@@ -6,6 +6,7 @@ Provides:
   - Data collection (CSICollector)
   - Dataset management (load, save, stats)
   - MVS detection (MVSDetector)
+  - Path setup for all tools (setup_paths)
 
 Author: Francesco Pace <francesco.pace@gmail.com>
 License: GPLv3
@@ -14,7 +15,9 @@ License: GPLv3
 import socket
 import struct
 import subprocess
+import sys
 import time
+import ipaddress
 import json
 import numpy as np
 import math
@@ -24,16 +27,63 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Dict, Any, Tuple
 
+
+# ============================================================================
+# Path Setup (called once at module import)
+# ============================================================================
+
+def setup_paths():
+    """
+    Add micro-espectre and src directories to sys.path.
+    
+    This allows tools to import from src/ and config.py.
+    Safe to call multiple times (checks for duplicates).
+    """
+    micro_espectre_path = str(Path(__file__).parent.parent)
+    src_path = str(Path(__file__).parent.parent / 'src')
+    
+    if src_path not in sys.path:
+        sys.path.insert(0, src_path)
+    if micro_espectre_path not in sys.path:
+        sys.path.insert(0, micro_espectre_path)
+
+
+# Auto-setup paths when this module is imported
+setup_paths()
+import src.config as config
+
 # ============================================================================
 # Constants
 # ============================================================================
 
-# Default subcarrier band for analysis (shared across all tools)
-DEFAULT_SUBCARRIERS = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22]
-
 # UDP Protocol constants
 MAGIC_STREAM = 0x4353  # "CS" in little-endian
 DEFAULT_PORT = 5001
+
+
+def get_default_bind_host() -> str:
+    """
+    Determine a safe default bind interface (single host address, no wildcard).
+
+    Priority:
+    1. CSI_BIND_HOST env var if set
+    2. Primary outbound IPv4 detected via UDP connect trick
+    3. Loopback as final fallback
+    """
+    import os
+
+    env_host = os.getenv('CSI_BIND_HOST', '').strip()
+    if env_host:
+        return env_host
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(('8.8.8.8', 80))
+        return probe.getsockname()[0]
+    except OSError:
+        return '127.0.0.1'
+    finally:
+        probe.close()
 
 # Dataset paths (shared between tools and tests)
 DATA_DIR = Path(__file__).parent.parent / 'data'
@@ -56,6 +106,7 @@ class CSIPacket:
     amplitudes: np.ndarray   # Amplitude per subcarrier
     phases: np.ndarray       # Phase per subcarrier (radians)
     chip: str = 'unknown'    # Chip type (e.g., 'C6', 'S3', 'ESP32')
+    gain_locked: bool = True # True if AGC gain lock was applied during collection
 
 
 # Chip code to name mapping (must match streamer)
@@ -86,16 +137,30 @@ class CSIReceiver:
         receiver.run()
     """
     
-    def __init__(self, port: int = DEFAULT_PORT, buffer_size: int = 500):
+    def __init__(
+        self,
+        port: int = DEFAULT_PORT,
+        buffer_size: int = 500,
+        bind_host: Optional[str] = None
+    ):
         """
         Initialize CSI receiver.
         
         Args:
             port: UDP port to listen on
             buffer_size: Circular buffer size (packets)
+            bind_host: Local interface IP to bind UDP socket
         """
         self.port = port
         self.buffer_size = buffer_size
+        resolved_bind_host = bind_host or get_default_bind_host()
+        self.bind_host = str(resolved_bind_host).strip()
+        if not self.bind_host:
+            raise ValueError('bind_host cannot be empty')
+        try:
+            ipaddress.ip_address(self.bind_host)
+        except ValueError as exc:
+            raise ValueError(f'Invalid bind_host: {self.bind_host}') from exc
         
         # Packet buffer (circular)
         self.buffer: deque[CSIPacket] = deque(maxlen=buffer_size)
@@ -139,23 +204,55 @@ class CSIReceiver:
     def _parse_packet(self, data: bytes) -> Optional[CSIPacket]:
         """Parse raw UDP data into CSIPacket
         
-        Packet format (6 byte header):
+        Packet format (7 byte header, v2):
+            <magic:2><chip:1><flags:1><seq:1><num_sc:2><payload>
+        
+        Flags byte:
+            bit 0: gain_locked (1 = AGC gain lock was applied)
+        
+        For backwards compatibility, also accepts 6 byte header (v1):
             <magic:2><chip:1><seq:1><num_sc:2><payload>
         """
         if len(data) < 6:
             return None
         
-        # Parse header
-        magic, chip_code, seq_num, num_sc = struct.unpack('<HBBH', data[:6])
-        
+        # Parse magic to validate packet
+        magic = struct.unpack('<H', data[:2])[0]
         if magic != MAGIC_STREAM:
             return None
         
+        # Detect header version based on packet size
+        # v1 (6 byte header): 6 + 128 = 134 bytes for HT20
+        # v2 (7 byte header): 7 + 128 = 135 bytes for HT20
+        # We detect by checking if data[3] looks like a flags byte (0x00 or 0x01)
+        # or a sequence number (0-255)
+        # Simpler: check packet length - v2 packets are 1 byte longer
+        
+        # Try v2 format first (7 byte header)
+        if len(data) >= 7:
+            chip_code, flags, seq_num, num_sc = struct.unpack('<BBBH', data[2:7])
+            header_size = 7
+            iq_size = num_sc * 2
+            
+            # Validate: if this doesn't make sense, fall back to v1
+            if len(data) == header_size + iq_size:
+                gain_locked = bool(flags & 0x01)
+            else:
+                # Try v1 format (6 byte header, no flags)
+                chip_code, seq_num, num_sc = struct.unpack('<BBH', data[2:6])
+                header_size = 6
+                iq_size = num_sc * 2
+                gain_locked = True  # Assume gain locked for legacy packets
+        else:
+            # v1 format
+            chip_code, seq_num, num_sc = struct.unpack('<BBH', data[2:6])
+            header_size = 6
+            iq_size = num_sc * 2
+            gain_locked = True  # Assume gain locked for legacy packets
+        
         chip = CHIP_CODES.get(chip_code, 'unknown')
-        header_size = 6
         
         # Parse I/Q data
-        iq_size = num_sc * 2
         if len(data) < header_size + iq_size:
             return None
         
@@ -181,7 +278,8 @@ class CSIReceiver:
             iq_complex=iq_complex,
             amplitudes=amplitudes,
             phases=phases,
-            chip=chip
+            chip=chip,
+            gain_locked=gain_locked
         )
     
     def _check_sequence(self, seq_num: int):
@@ -275,11 +373,11 @@ class CSIReceiver:
         """
         # Create socket
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.bind(('0.0.0.0', self.port))
+        self.sock.bind((self.bind_host, self.port))
         self.sock.settimeout(1.0)  # 1 second timeout for graceful shutdown
         
         if not quiet:
-            print(f'CSI Receiver listening on UDP port {self.port}')
+            print(f'CSI Receiver listening on {self.bind_host}:{self.port}')
             print(f'Buffer size: {self.buffer_size} packets')
             print('Waiting for data...')
             print()
@@ -389,8 +487,19 @@ class CSICollector:
     
     # File format version - increment when format changes
     FORMAT_VERSION = '1.0'
+    # Implicit readiness gate before each sample recording
+    READY_STABLE_SECONDS = 3.0
+    READY_MV_THRESHOLD = 1.0
+    READY_REFRESH_SECONDS = 0.2
     
-    def __init__(self, label: str, port: int = DEFAULT_PORT, contributor: str = None):
+    def __init__(
+        self,
+        label: str,
+        port: int = DEFAULT_PORT,
+        contributor: str = None,
+        description: str = None,
+        bind_host: Optional[str] = None
+    ):
         """
         Initialize collector.
         
@@ -398,16 +507,21 @@ class CSICollector:
             label: Label for collected samples (e.g., 'wave', 'baseline')
             port: UDP port for CSI receiver
             contributor: GitHub username of the contributor (auto-detected from git if not provided)
+            description: Optional description for the collected samples
+            bind_host: Local interface IP to bind UDP socket
         """
         self.label = label
         self.port = port
+        self.bind_host = bind_host
         self.chip = None  # Auto-detected from CSI packets
         self.contributor = contributor or get_git_username()
+        self.description = description
         
-        self.receiver = CSIReceiver(port=port, buffer_size=2000)
+        self.receiver = CSIReceiver(port=port, buffer_size=2000, bind_host=bind_host)
         self._recording = False
         self._recorded_packets: List[CSIPacket] = []
         self._sample_count = 0
+        self._ready_detector = self._build_ready_detector()
     
     def _get_label_dir(self) -> Path:
         """Get directory for this label, create if needed"""
@@ -435,7 +549,6 @@ class CSICollector:
             csi_data: int8[N, num_sc*2] - Raw I/Q values
             num_subcarriers: int - Number of subcarriers (64 for HT20)
             label: str - Label name
-            label_id: int - Numeric label ID
             chip: str - Chip type (C6, S3, etc.)
             collected_at: str - ISO timestamp
             duration_ms: float - Total duration
@@ -455,9 +568,6 @@ class CSICollector:
         timestamps = np.array([p.timestamp for p in packets])
         duration_ms = (timestamps[-1] - timestamps[0]) * 1000 if len(timestamps) > 1 else 0
         
-        # Get label ID from dataset info
-        label_id = self._get_or_create_label_id()
-        
         # Build sample dict (unified format)
         sample = {
             # CSI data (essential)
@@ -466,7 +576,6 @@ class CSICollector:
             
             # Label (ground truth)
             'label': self.label,
-            'label_id': label_id,
             
             # Context
             'chip': self.chip or 'unknown',
@@ -476,6 +585,13 @@ class CSICollector:
             'duration_ms': duration_ms,
             'format_version': self.FORMAT_VERSION,
         }
+        
+        # Determine if gain lock was applied (from packet flags)
+        # All packets in a session have the same gain_locked value
+        gain_locked = packets[0].gain_locked if hasattr(packets[0], 'gain_locked') else True
+        
+        # Add gain_locked to sample for future reference
+        sample['gain_locked'] = gain_locked
         
         # Save file
         label_dir = self._get_label_dir()
@@ -491,34 +607,17 @@ class CSICollector:
             num_subcarriers=num_subcarriers,
             num_packets=len(packets),
             duration_ms=duration_ms,
-            collected_at=sample['collected_at']
+            collected_at=sample['collected_at'],
+            gain_locked=gain_locked,
+            description=self.description
         )
         
         return filepath
     
-    def _get_or_create_label_id(self) -> int:
-        """Get or create label ID from dataset info"""
-        info = load_dataset_info()
-        
-        if self.label in info['labels']:
-            return info['labels'][self.label]['id']
-        
-        # Create new label ID (max existing + 1)
-        existing_ids = [l['id'] for l in info['labels'].values()]
-        new_id = max(existing_ids) + 1 if existing_ids else 0
-        
-        info['labels'][self.label] = {
-            'id': new_id,
-            'samples': 0,
-            'description': ''
-        }
-        save_dataset_info(info)
-        
-        return new_id
-    
     def _update_dataset_info(self, filename: str = None, num_subcarriers: int = None,
                                 num_packets: int = None, duration_ms: float = None,
-                                collected_at: str = None):
+                                collected_at: str = None, gain_locked: bool = True,
+                                description: str = None):
         """Update dataset info with current sample counts and file details"""
         info = load_dataset_info()
         
@@ -528,7 +627,6 @@ class CSICollector:
         
         if self.label not in info['labels']:
             info['labels'][self.label] = {
-                'id': len(info['labels']),
                 'description': ''
             }
         
@@ -542,6 +640,17 @@ class CSICollector:
             # Check if file already exists in list
             existing_files = [f['filename'] for f in info['files'][self.label]]
             if filename not in existing_files:
+                # Build description based on gain lock status
+                if not description:
+                    if not gain_locked:
+                        chip = self.chip.upper() if self.chip else 'unknown'
+                        if chip == 'ESP32':
+                            description = f'HT20 {self.label}, no gain lock (ESP32 lacks AGC lock support)'
+                        else:
+                            description = f'HT20 {self.label}, gain lock skipped (weak signal or disabled)'
+                    else:
+                        description = f'HT20 {self.label}, AGC gain locked'
+                
                 file_info = {
                     'filename': filename,
                     'chip': self.chip.upper() if self.chip else 'unknown',
@@ -550,21 +659,191 @@ class CSICollector:
                     'collected_at': collected_at or '',
                     'duration_ms': int(duration_ms) if duration_ms else 0,
                     'num_packets': num_packets or 0,
-                    'description': ''
+                    'gain_locked': bool(gain_locked),
+                    'description': description
                 }
                 info['files'][self.label].append(file_info)
         
         save_dataset_info(info)
-    
-    def collect_timed(self, duration: float, num_samples: int = 1,
-                     countdown: int = 3, quiet: bool = False) -> List[Path]:
+
+    def _drain_udp_backlog(self, max_packets: int = 10000) -> int:
+        """
+        Drain queued UDP packets to align sample start with current time.
+
+        When `collect_timed()` waits during countdown, packets can accumulate in
+        the OS socket buffer. Without draining, the next sample may include old
+        packets (pre-countdown), inflating packet count and breaking duration
+        coherence against streamer PPS.
+
+        Args:
+            max_packets: Safety cap to avoid infinite loops
+
+        Returns:
+            int: Number of drained packets
+        """
+        if self.receiver.sock is None:
+            return 0
+
+        drained = 0
+        previous_timeout = self.receiver.sock.gettimeout()
+        self.receiver.sock.settimeout(0.0)  # non-blocking drain
+        try:
+            while drained < max_packets:
+                try:
+                    self.receiver.sock.recvfrom(1024)
+                    drained += 1
+                except (BlockingIOError, socket.timeout):
+                    break
+        finally:
+            self.receiver.sock.settimeout(previous_timeout)
+        return drained
+
+    def _build_ready_detector(self) -> "MVSDetector":
+        """
+        Build a lightweight MVS detector used only as pre-recording gate.
+
+        Uses the unified default subcarriers to provide a stable and model-aligned
+        readiness indicator before each sample acquisition.
+        """
+        window_size = int(getattr(config, 'SEG_WINDOW_SIZE', 100))
+        if window_size < 10:
+            window_size = 10
+        elif window_size > 200:
+            window_size = 200
+
+        return MVSDetector(
+            window_size=window_size,
+            threshold=self.READY_MV_THRESHOLD,
+            selected_subcarriers=config.DEFAULT_SUBCARRIERS,
+            track_data=False,
+            gain_locked=True
+        )
+
+    @staticmethod
+    def _build_status_bar(ratio: float, width: int = 18) -> str:
+        """Build a compact ASCII progress bar for terminal status."""
+        clamped = max(0.0, min(1.0, ratio))
+        filled = int(round(clamped * width))
+        return '[' + ('#' * filled) + ('-' * (width - filled)) + ']'
+
+    def _wait_for_ready_state(self, quiet: bool = False) -> None:
+        """
+        Wait until environment is stable before recording.
+
+        Ready condition:
+        - moving variance <= READY_MV_THRESHOLD
+        - condition remains true for READY_STABLE_SECONDS continuously
+        """
+        if self.receiver.sock is None:
+            raise RuntimeError('Receiver socket is not initialized')
+
+        self.receiver.reset_stats()
+        self._ready_detector.reset()
+
+        warmup_target = self._ready_detector.window_size
+        processed_packets = 0
+        stable_since = None
+        last_render = 0.0
+        last_pps_time = time.monotonic()
+        last_pps_count = 0
+        current_pps = 0
+        current_mv = 0.0
+        current_state = 'WARMUP'
+        ready_ratio = 0.0
+
+        while True:
+            try:
+                data, addr = self.receiver.sock.recvfrom(1024)
+                packet = self.receiver._parse_packet(data)
+                if packet is None:
+                    continue
+
+                processed_packets += 1
+                self.receiver.packet_count += 1
+                self.receiver._check_sequence(packet.seq_num)
+
+                packet_dict = {
+                    'csi_data': packet.iq_raw,
+                    'gain_locked': packet.gain_locked
+                }
+                self._ready_detector.process_packet(packet_dict)
+
+                if processed_packets >= warmup_target:
+                    current_mv = self._ready_detector._context.current_moving_variance
+                    current_state = 'UNSTABLE' if current_mv > self.READY_MV_THRESHOLD else 'READY'
+                    ready_ratio = min(current_mv / self.READY_MV_THRESHOLD, 1.0)
+
+                    now = time.monotonic()
+                    if current_mv <= self.READY_MV_THRESHOLD:
+                        if stable_since is None:
+                            stable_since = now
+                    else:
+                        stable_since = None
+
+                    stable_elapsed = 0.0 if stable_since is None else (now - stable_since)
+                    if stable_elapsed >= self.READY_STABLE_SECONDS:
+                        if not quiet:
+                            print(
+                                '\r'
+                                + f'  {self._build_status_bar(ready_ratio)} '
+                                + f'MV {current_mv:.3f}/{self.READY_MV_THRESHOLD:.3f} '
+                                + f'| stable {self.READY_STABLE_SECONDS:.1f}/{self.READY_STABLE_SECONDS:.1f}s '
+                                + f'| pps {current_pps:3d} '
+                                + f'| drop {self.receiver.get_stats()["drop_rate"]:.1f}% '
+                                + '| READY',
+                                end='',
+                                flush=True
+                            )
+                            print()
+                        return
+                else:
+                    current_state = f'WARMUP {processed_packets}/{warmup_target}'
+                    stable_elapsed = 0.0
+
+                now = time.monotonic()
+                if now - last_pps_time >= 1.0:
+                    delta = processed_packets - last_pps_count
+                    elapsed = now - last_pps_time
+                    current_pps = int(delta / elapsed) if elapsed > 0 else 0
+                    last_pps_time = now
+                    last_pps_count = processed_packets
+
+                if (not quiet) and (now - last_render >= self.READY_REFRESH_SECONDS):
+                    drop_rate = self.receiver.get_stats()['drop_rate']
+                    status_bar = self._build_status_bar(ready_ratio)
+                    print(
+                        '\r'
+                        + f'  {status_bar} '
+                        + f'MV {current_mv:.3f}/{self.READY_MV_THRESHOLD:.3f} '
+                        + f'| stable {stable_elapsed:.1f}/{self.READY_STABLE_SECONDS:.1f}s '
+                        + f'| pps {current_pps:3d} '
+                        + f'| drop {drop_rate:.1f}% '
+                        + f'| {current_state}',
+                        end='',
+                        flush=True
+                    )
+                    last_render = now
+
+            except socket.timeout:
+                now = time.monotonic()
+                if (not quiet) and (now - last_render >= self.READY_REFRESH_SECONDS):
+                    print(
+                        '\r'
+                        + '  [------------------] waiting packets...'
+                        + ' | stable 0.0/3.0s | pps   0 | drop 0.0% | NO DATA',
+                        end='',
+                        flush=True
+                    )
+                    last_render = now
+                continue
+
+    def collect_timed(self, duration: float, num_samples: int = 1, quiet: bool = False) -> List[Path]:
         """
         Collect samples with fixed duration.
         
         Args:
             duration: Duration per sample in seconds
             num_samples: Number of samples to collect
-            countdown: Countdown seconds before each sample
             quiet: Suppress output
         
         Returns:
@@ -578,31 +857,33 @@ class CSICollector:
             print(f'{"=" * 60}')
             print(f'  Duration per sample: {duration}s')
             print(f'  Samples to collect:  {num_samples}')
+            print(f'  Ready gate:          implicit ({self.READY_STABLE_SECONDS:.1f}s stable)')
             print(f'{"=" * 60}\n')
         
         # Create socket once
         self.receiver.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.receiver.sock.bind(('0.0.0.0', self.port))
+        self.receiver.sock.bind((self.receiver.bind_host, self.port))
         self.receiver.sock.settimeout(0.1)
         
         try:
             for sample_idx in range(num_samples):
                 if not quiet:
                     print(f'\nSample {sample_idx + 1}/{num_samples}')
-                    
-                    # Countdown
-                    for i in range(countdown, 0, -1):
-                        print(f'  Starting in {i}...', end='\r')
-                        time.sleep(1)
-                    
-                    print(f'  ▶ RECORDING...', end='', flush=True)
-                
+                    print('  Waiting for stable scene (ML subcarriers + MVS)...', flush=True)
+
+                # Flush packets that accumulated during countdown/idle time.
+                self._drain_udp_backlog()
+                self._wait_for_ready_state(quiet=quiet)
+
+                if not quiet:
+                    print('  ▶ RECORDING...', end='', flush=True)
+
                 # Reset and collect
                 self.receiver.reset_stats()
                 packets = []
-                start_time = time.time()
-                
-                while time.time() - start_time < duration:
+                deadline = time.monotonic() + duration
+
+                while time.monotonic() < deadline:
                     try:
                         data, addr = self.receiver.sock.recvfrom(1024)  # 134 bytes for 64 SC (HT20)
                         packet = self.receiver._parse_packet(data)
@@ -634,7 +915,7 @@ class CSICollector:
         
         return saved_files
     
-    def collect_interactive(self, num_samples: int = 10) -> List[Path]:
+    def collect_interactive(self, num_samples: int = 10, duration: float = 2.0) -> List[Path]:
         """
         Collect samples with keyboard control.
         
@@ -642,6 +923,7 @@ class CSICollector:
         
         Args:
             num_samples: Target number of samples
+            duration: Duration per sample in seconds
         
         Returns:
             List of paths to saved samples
@@ -659,7 +941,7 @@ class CSICollector:
         
         # Create socket once
         self.receiver.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.receiver.sock.bind(('0.0.0.0', self.port))
+        self.receiver.sock.bind((self.receiver.bind_host, self.port))
         self.receiver.sock.settimeout(0.1)
         
         try:
@@ -672,19 +954,26 @@ class CSICollector:
                         print('Collection cancelled.')
                         break
                     
-                    print('  Recording for 2 seconds...', end='', flush=True)
-                    
-                    # Collect for 2 seconds
+                    print(f'  Recording for {duration} seconds...', end='', flush=True)
+
+                    # Flush packets that accumulated while waiting for user input.
+                    self._drain_udp_backlog()
+                    print('  Waiting for stable scene (ML subcarriers + MVS)...', flush=True)
+                    self._wait_for_ready_state(quiet=False)
+                    print('  ▶ RECORDING...', end='', flush=True)
+
+                    # Collect for configured duration
                     self.receiver.reset_stats()
                     packets = []
-                    start_time = time.time()
-                    
-                    while time.time() - start_time < 2.0:
+                    deadline = time.monotonic() + duration
+
+                    while time.monotonic() < deadline:
                         try:
                             data, addr = self.receiver.sock.recvfrom(1024)  # 134 bytes for 64 SC (HT20)
                             packet = self.receiver._parse_packet(data)
                             if packet:
                                 packets.append(packet)
+                                self.receiver._check_sequence(packet.seq_num)
                         except socket.timeout:
                             continue
                     
@@ -766,12 +1055,11 @@ def get_dataset_stats() -> Dict[str, Any]:
                 try:
                     sample = np.load(samples[0])
                     avg_packets = sample['num_packets']
-                except:
+                except Exception:
                     avg_packets = 0
                 
                 stats['labels'][label] = {
                     'samples': len(samples),
-                    'id': info.get('labels', {}).get(label, {}).get('id', -1)
                 }
                 stats['total_samples'] += len(samples)
                 stats['labels_count'] += 1
@@ -815,33 +1103,27 @@ def load_samples(label: str = None) -> List[Dict[str, Any]]:
     return samples
 
 
-def load_samples_as_arrays(labels: List[str] = None) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Load samples as X, y arrays for ML training.
-    
-    Args:
-        labels: List of labels to load (None = all)
-    
-    Returns:
-        Tuple (X, y) where X is array of amplitudes, y is array of label IDs
-    """
-    all_samples = load_samples()
-    
-    if labels:
-        all_samples = [s for s in all_samples if s['label'] in labels]
-    
-    if not all_samples:
-        return np.array([]), np.array([])
-    
-    X = [s['amplitudes'] for s in all_samples]
-    y = [s['label_id'] for s in all_samples]
-    
-    return X, np.array(y)
-
-
 # ============================================================================
 # Data Loading Functions
 # ============================================================================
+
+def read_gain_locked(filepath: Path) -> Optional[bool]:
+    """
+    Read the 'gain_locked' field from an NPZ file.
+
+    Returns True if gain lock was active, False if not, or None if the field
+    is absent (older files collected before the field was added).
+
+    Args:
+        filepath: Path to the .npz file
+
+    Returns:
+        bool or None
+    """
+    data = np.load(filepath, allow_pickle=True)
+    if 'gain_locked' in data.files:
+        return bool(data['gain_locked'])
+    return None
 
 def load_npz_as_packets(filepath: Path) -> List[Dict[str, Any]]:
     """
@@ -871,6 +1153,7 @@ def load_npz_as_packets(filepath: Path) -> List[Dict[str, Any]]:
     label = str(data.get('label', 'unknown'))
     num_subcarriers = int(data.get('num_subcarriers', csi_array.shape[1] // 2))
     chip = str(data.get('chip', 'unknown'))
+    gain_locked = bool(data['gain_locked']) if 'gain_locked' in data.files else True
     
     # Build packet list
     packets = []
@@ -879,7 +1162,8 @@ def load_npz_as_packets(filepath: Path) -> List[Dict[str, Any]]:
             'csi_data': np.array(csi_array[i], dtype=np.int8),
             'label': label,
             'num_subcarriers': num_subcarriers,
-            'chip': chip
+            'chip': chip,
+            'gain_locked': gain_locked
         })
     
     return packets
@@ -887,7 +1171,7 @@ def load_npz_as_packets(filepath: Path) -> List[Dict[str, Any]]:
 
 def find_dataset(chip: str = None, num_sc: int = 64) -> Tuple[Path, Path, str]:
     """
-    Find the most recent baseline and movement dataset files.
+    Find baseline and movement dataset files with nearest timestamps.
     
     Args:
         chip: Chip type (C6, S3, etc.) or None to find any chip
@@ -927,9 +1211,69 @@ def find_dataset(chip: str = None, num_sc: int = 64) -> Tuple[Path, Path, str]:
             f"Collect data using: ./me collect --label movement --duration 10"
         )
     
-    # Use the most recent file (sorted by name, which includes timestamp)
-    baseline_file = sorted(baseline_files)[-1]
-    movement_file = sorted(movement_files)[-1]
+    # Prefer nearest baseline/movement pair from dataset_info metadata, so
+    # Python tests match C++ csi_test_data.h pairing policy.
+    baseline_file = None
+    movement_file = None
+    try:
+        info = load_dataset_info()
+        files_section = info.get('files', {})
+        baseline_meta = files_section.get('baseline', [])
+        movement_meta = files_section.get('movement', [])
+
+        def _meta_matches(entry: Dict[str, Any], label_chip: Optional[str]) -> bool:
+            if int(entry.get('subcarriers', 0)) != int(num_sc):
+                return False
+            if label_chip is None:
+                return True
+            return str(entry.get('chip', '')).upper() == label_chip.upper()
+
+        def _parse_ts(value: Any) -> Optional[datetime]:
+            if not value:
+                return None
+            try:
+                # Supports both naive and timezone-aware ISO strings.
+                return datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+
+        selected_chip = chip.upper() if chip else None
+        baseline_candidates = []
+        movement_candidates = []
+        for entry in baseline_meta:
+            if _meta_matches(entry, selected_chip):
+                ts = _parse_ts(entry.get('collected_at'))
+                filename = entry.get('filename')
+                if ts and filename:
+                    candidate = baseline_dir / str(filename)
+                    if candidate.exists():
+                        baseline_candidates.append((ts, candidate))
+        for entry in movement_meta:
+            if _meta_matches(entry, selected_chip):
+                ts = _parse_ts(entry.get('collected_at'))
+                filename = entry.get('filename')
+                if ts and filename:
+                    candidate = movement_dir / str(filename)
+                    if candidate.exists():
+                        movement_candidates.append((ts, candidate))
+
+        best_delta = None
+        for b_ts, b_path in baseline_candidates:
+            for m_ts, m_path in movement_candidates:
+                delta = abs((m_ts - b_ts).total_seconds())
+                if best_delta is None or delta < best_delta:
+                    best_delta = delta
+                    baseline_file = b_path
+                    movement_file = m_path
+    except Exception:
+        # Keep backward-compatible fallback below.
+        baseline_file = None
+        movement_file = None
+
+    # Fallback: use the most recent files by filename timestamp.
+    if baseline_file is None or movement_file is None:
+        baseline_file = sorted(baseline_files)[-1]
+        movement_file = sorted(movement_files)[-1]
     
     # Extract chip name from filename (e.g., baseline_c6_64sc_... -> C6)
     chip_name = baseline_file.stem.split('_')[1].upper()
@@ -1004,10 +1348,9 @@ from segmentation import SegmentationContext
 from filters import HampelFilter
 
 # Import feature calculation functions from src/features.py
-from features import calc_skewness, calc_kurtosis
+from features import calc_skewness
 
-# Import calibrators from src (band selection algorithms)
-from p95_calibrator import P95Calibrator
+# Import calibrator from src (band selection algorithm)
 from nbvi_calibrator import NBVICalibrator
 
 # Import detectors from src (IDetector interface and implementations)
@@ -1019,20 +1362,26 @@ from mvs_detector import MVSDetector as MVSDetectorNew
 # Utility Functions (delegate to SegmentationContext static methods)
 # ============================================================================
 
-def calculate_spatial_turbulence(csi_data, selected_subcarriers) -> float:
+def calculate_spatial_turbulence(csi_data, selected_subcarriers, gain_locked: bool = True) -> float:
     """
-    Calculate spatial turbulence (standard deviation of amplitudes)
+    Calculate spatial turbulence from CSI data with gain-lock-aware normalization.
     
     Delegates to SegmentationContext.compute_spatial_turbulence (static method).
+    If gain lock is not active, uses CV normalization (std/mean) for gain invariance.
+    If gain lock is active, uses raw standard deviation for better sensitivity.
     
     Args:
         csi_data: CSI data array (I/Q pairs)
         selected_subcarriers: List of subcarrier indices to use
+        gain_locked: True if AGC gain lock was active for this packet/file
     
     Returns:
-        float: Spatial turbulence value (standard deviation of amplitudes)
+        float: Spatial turbulence value
     """
-    turbulence, _ = SegmentationContext.compute_spatial_turbulence(csi_data, selected_subcarriers)
+    use_cv_norm = not bool(gain_locked)
+    turbulence, _ = SegmentationContext.compute_spatial_turbulence(
+        csi_data, selected_subcarriers, use_cv_normalization=use_cv_norm
+    )
     return turbulence
 
 
@@ -1062,9 +1411,10 @@ class MVSDetector:
     
     def __init__(self, window_size: int, threshold: float, 
                  selected_subcarriers: List[int], track_data: bool = False,
-                 enable_hampel: bool = False, hampel_window: int = 7,
-                 hampel_threshold: float = 4.0,
-                 enable_lowpass: bool = False, lowpass_cutoff: float = 11.0):
+                 enable_hampel: bool = True, hampel_window: int = config.HAMPEL_WINDOW,
+                 hampel_threshold: float = config.HAMPEL_THRESHOLD,
+                 enable_lowpass: bool = False, lowpass_cutoff: float = 11.0,
+                 gain_locked: bool = True):
         """
         Initialize MVS detector
         
@@ -1078,11 +1428,13 @@ class MVSDetector:
             hampel_threshold: Hampel filter MAD threshold
             enable_lowpass: Enable low-pass filter for noise reduction
             lowpass_cutoff: Low-pass filter cutoff frequency in Hz
+            gain_locked: Default gain lock status for packets without metadata
         """
         self.window_size = window_size
         self.threshold = threshold
         self.selected_subcarriers = selected_subcarriers
         self.track_data = track_data
+        self.default_gain_locked = bool(gain_locked)
         
         # Use production SegmentationContext
         self._context = SegmentationContext(
@@ -1094,6 +1446,7 @@ class MVSDetector:
             enable_lowpass=enable_lowpass,
             lowpass_cutoff=lowpass_cutoff
         )
+        self._context.use_cv_normalization = not self.default_gain_locked
         
         self.state = 'IDLE'
         self.motion_packet_count = 0
@@ -1105,13 +1458,24 @@ class MVSDetector:
             self.moving_var_history: List[float] = []
             self.state_history: List[str] = []
     
-    def process_packet(self, csi_data):
+    def process_packet(self, packet_or_csi, gain_locked: Optional[bool] = None):
         """
         Process a single CSI packet
         
         Args:
-            csi_data: CSI data array (I/Q pairs)
+            packet_or_csi: Either packet dict with {'csi_data', 'gain_locked'} or CSI array
+            gain_locked: Optional gain lock override when passing raw CSI array
         """
+        if isinstance(packet_or_csi, dict):
+            csi_data = packet_or_csi['csi_data']
+            packet_gain_locked = bool(packet_or_csi.get('gain_locked', self.default_gain_locked))
+        else:
+            csi_data = packet_or_csi
+            packet_gain_locked = self.default_gain_locked if gain_locked is None else bool(gain_locked)
+        
+        # Apply packet-aware normalization mode before turbulence calculation.
+        self._context.use_cv_normalization = not packet_gain_locked
+        
         # Calculate turbulence using SegmentationContext method
         turb = self._context.calculate_spatial_turbulence(csi_data, self.selected_subcarriers)
         
@@ -1148,7 +1512,7 @@ class MVSDetector:
         return self.motion_packet_count
 
 
-def test_mvs_configuration(baseline_packets, movement_packets, 
+def test_mvs_configuration(baseline_packets, movement_packets,
                           subcarriers, threshold, window_size) -> Tuple[int, int, float]:
     """
     Test MVS configuration and return FP, TP counts
@@ -1163,24 +1527,50 @@ def test_mvs_configuration(baseline_packets, movement_packets,
     Returns:
         tuple: (fp, tp, score)
     """
+    num_baseline = len(baseline_packets)
+    num_movement = len(movement_packets)
+
     # Test on baseline (FP)
     detector = MVSDetector(window_size, threshold, subcarriers)
     for pkt in baseline_packets:
-        detector.process_packet(pkt['csi_data'])
+        detector.process_packet(pkt)
     fp = detector.get_motion_count()
-    
+
+    # Keep the turbulence buffer warm across baseline -> movement to match
+    # real performance tests and runtime behavior. Reset only motion counter.
+    detector.motion_packet_count = 0
+
     # Test on movement (TP)
-    detector.reset()
     for pkt in movement_packets:
-        detector.process_packet(pkt['csi_data'])
+        detector.process_packet(pkt)
     tp = detector.get_motion_count()
-    
-    # Calculate score
-    if tp == 0:
-        score = -1000.0
-    elif fp == 0:
-        score = 1000.0 + tp
+
+    fn = max(0, num_movement - tp)
+    recall = (tp / num_movement * 100.0) if num_movement > 0 else 0.0
+    precision = (tp / (tp + fp) * 100.0) if (tp + fp) > 0 else 0.0
+    fp_rate = (fp / num_baseline * 100.0) if num_baseline > 0 else 100.0
+    f1_score = 0.0
+    if (precision + recall) > 0.0:
+        f1_score = 2.0 * precision * recall / (precision + recall)
+
+    # Match performance objectives:
+    # - primary: satisfy recall/FP constraints
+    # - secondary: maximize F1 among valid candidates
+    recall_target = 95.0
+    fp_target = 10.0
+    fn_rate = (fn / num_movement * 100.0) if num_movement > 0 else 100.0
+
+    if recall >= recall_target and fp_rate <= fp_target:
+        score = 1_000_000.0 + f1_score * 100.0 - fp_rate
+    elif recall >= recall_target:
+        score = 100_000.0 - (fp_rate - fp_target) * 1_000.0 + f1_score * 10.0
     else:
-        score = tp - fp * 100
-    
+        score = (
+            -1_000_000.0
+            - (recall_target - recall) * 2_000.0
+            - fn_rate * 200.0
+            - fp_rate * 20.0
+            + precision
+        )
+
     return fp, tp, score

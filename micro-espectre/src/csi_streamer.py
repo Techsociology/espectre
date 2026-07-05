@@ -4,15 +4,16 @@ Micro-ESPectre - CSI UDP Streamer
 Streams raw CSI I/Q data via UDP for real-time processing.
 
 Packet format:
-  Header (6 bytes):
+  Header (7 bytes):
     - Magic: 0x4353 ("CS") - 2 bytes
     - Chip type: 1 byte (0=unknown, 1=ESP32, 2=S2, 3=S3, 4=C3, 5=C5, 6=C6)
+    - Flags: 1 byte (bit 0 = gain_locked)
     - Sequence number: 1 byte (0-255, wrapping)
     - Num subcarriers: 2 bytes (uint16, little-endian)
   Payload (N × 2 bytes):
     - I0, Q0, I1, Q1, ... (int8 each)
 
-HT20 only: 64 subcarriers, packet size = 6 + 128 = 134 bytes
+HT20 only: 64 subcarriers, packet size = 7 + 128 = 135 bytes
 
 Usage:
     ./me stream --ip 192.168.1.100
@@ -21,7 +22,6 @@ Author: Francesco Pace <francesco.pace@gmail.com>
 License: GPLv3
 """
 import socket
-import struct
 import time
 import gc
 import os
@@ -29,6 +29,7 @@ import src.config as config
 from src.config import NUM_SUBCARRIERS, EXPECTED_CSI_LEN
 from src.traffic_generator import TrafficGenerator
 from src.main import connect_wifi, cleanup_wifi, run_gain_lock
+from src.utils import normalize_ht20_csi_payload
 
 # Streaming configuration
 STREAM_PORT = 5001
@@ -84,41 +85,48 @@ def stream_csi(dest_ip, duration_sec=0):
     print(f'Chip: {chip_type} (code: {chip_code})')
     
     # Start traffic generator
-    traffic_gen = TrafficGenerator()
+    traffic_mode = getattr(config, 'TRAFFIC_GENERATOR_MODE', 'ping')
+    traffic_gen = TrafficGenerator(mode=traffic_mode)
     traffic_gen_started = False
     if config.TRAFFIC_GENERATOR_RATE > 0:
         if traffic_gen.start(config.TRAFFIC_GENERATOR_RATE):
             traffic_gen_started = True
-            print(f'Traffic generator: {config.TRAFFIC_GENERATOR_RATE} pps')
+            print(f'Traffic generator: {traffic_mode}, {config.TRAFFIC_GENERATOR_RATE} pps')
         time.sleep(1)
     
     # Phase 1: Gain lock (stabilizes AGC/FFT)
     # Do this BEFORE creating streaming socket to avoid ENOMEM
     gc.collect()
-    run_gain_lock(wlan)
-    # Note: Streaming sends RAW data without gain compensation
-    # Compensation is applied during inference (detection), not collection
+    agc, fft, needs_cv = run_gain_lock(wlan)
+    # needs_cv = True means gain lock was skipped (AGC too low or not supported)
+    # This flag is sent in each packet so the receiver knows if CV normalization is needed
+    gain_locked = not needs_cv
+    print(f'Gain locked: {gain_locked} (needs_cv_normalization={needs_cv})')
     
     # Create UDP socket for streaming (after gain lock to reduce memory pressure)
     gc.collect()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     dest_addr = (dest_ip, STREAM_PORT)
     
-    # Packet format: <magic><chip><seq><num_sc_u16><payload>
+    # Packet format: <magic><chip><flags><seq><num_sc_u16><payload>
     # Pre-allocate packet buffer to avoid memory allocation in loop
-    header_size = 6  # magic(2) + chip(1) + seq(1) + num_sc(2)
+    header_size = 7  # magic(2) + chip(1) + flags(1) + seq(1) + num_sc(2)
     payload_size = EXPECTED_CSI_LEN  # 64 SC × 2 bytes
     packet_size = header_size + payload_size
     
+    # Build flags byte (bit 0 = gain_locked)
+    flags = 0x01 if gain_locked else 0x00
+    
     # Pre-allocate bytearray (reused every iteration)
     packet_buf = bytearray(packet_size)
-    # Write static header fields (magic, chip, num_sc) - only seq changes
+    # Write static header fields (magic, chip, flags, num_sc) - only seq changes
     packet_buf[0] = MAGIC_STREAM & 0xFF
     packet_buf[1] = (MAGIC_STREAM >> 8) & 0xFF
     packet_buf[2] = chip_code
-    # packet_buf[3] = seq_num (updated in loop)
-    packet_buf[4] = NUM_SUBCARRIERS & 0xFF
-    packet_buf[5] = (NUM_SUBCARRIERS >> 8) & 0xFF
+    packet_buf[3] = flags
+    # packet_buf[4] = seq_num (updated in loop)
+    packet_buf[5] = NUM_SUBCARRIERS & 0xFF
+    packet_buf[6] = (NUM_SUBCARRIERS >> 8) & 0xFF
     
     print('')
     print(f'Streaming to: {dest_ip}:{STREAM_PORT}')
@@ -138,6 +146,9 @@ def stream_csi(dest_ip, duration_sec=0):
     seq_num = 0
     last_progress_time = start_time
     last_progress_count = 0
+    collapse_logged = False
+    remap_logged = False
+    ht57_remap_buffer = bytearray(EXPECTED_CSI_LEN)
     
     try:
         while True:
@@ -149,23 +160,29 @@ def stream_csi(dest_ip, duration_sec=0):
             
             frame = wlan.csi_read()
             if frame:
-                # Filter packets by expected CSI length (HT20: 128 bytes)
-                if len(frame[5]) != EXPECTED_CSI_LEN:
+                csi_data, raw_len, remap_tag = normalize_ht20_csi_payload(
+                    frame[5], EXPECTED_CSI_LEN, remap_buffer=ht57_remap_buffer
+                )
+
+                if csi_data is None:
                     filtered_count += 1
-                    # Log warning every 100 filtered packets
                     if filtered_count % 100 == 1:
-                        print(f'[WARN] Filtered {filtered_count} packets with wrong SC count (got {len(frame[5])} bytes)')
+                        print(f"[WARN] Filtered {filtered_count} packets with wrong SC count (got {raw_len} bytes, expected {EXPECTED_CSI_LEN})")
                     del frame
                     continue
-                
-                # Extract CSI data (HT20: 128 bytes) - sent RAW without compensation
-                csi_data = frame[5][:EXPECTED_CSI_LEN]
+
+                if remap_tag in ('double_ht20', 'double_ht57_and_remap') and not collapse_logged:
+                    print("[INFO] CSI double-length collapse active: 256->128 and/or 228->114")
+                    collapse_logged = True
+                if remap_tag in ('ht57_to_64', 'double_ht57_and_remap') and not remap_logged:
+                    print("[INFO] CSI remap active: 57->64 SC (left_pad=4, right_pad=3)")
+                    remap_logged = True
                 del frame
                 
                 # Build and send packet using pre-allocated buffer (zero allocation)
                 try:
                     # Update seq_num in header
-                    packet_buf[3] = seq_num
+                    packet_buf[4] = seq_num
                     # Copy CSI data into payload section
                     packet_buf[header_size:] = csi_data
                     # Send packet

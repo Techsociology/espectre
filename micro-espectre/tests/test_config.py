@@ -55,7 +55,15 @@ class TestConfigConstants:
         config = load_src_config()
         
         assert hasattr(config, 'TRAFFIC_GENERATOR_RATE')
+        assert hasattr(config, 'PUBLISH_INTERVAL')
+        assert hasattr(config, 'EVALUATION_INTERVAL')
+        assert hasattr(config, 'MOTION_ON_HITS')
+        assert hasattr(config, 'MOTION_OFF_HITS')
         assert isinstance(config.TRAFFIC_GENERATOR_RATE, int)
+        assert isinstance(config.PUBLISH_INTERVAL, int)
+        assert isinstance(config.EVALUATION_INTERVAL, int)
+        assert isinstance(config.MOTION_ON_HITS, int)
+        assert isinstance(config.MOTION_OFF_HITS, int)
         assert config.TRAFFIC_GENERATOR_RATE >= 0
     
     def test_csi_config(self):
@@ -83,7 +91,7 @@ class TestConfigConstants:
         
         assert isinstance(config.SEG_WINDOW_SIZE, int)
         assert config.SEG_WINDOW_SIZE > 0
-        # Note: threshold is calculated adaptively (P95 × 1.4), not in config
+        # Note: threshold is calculated adaptively (P95), not in config
     
     def test_lowpass_filter_config(self):
         """Test low-pass filter configuration"""
@@ -119,6 +127,10 @@ class TestConfigDefaultValues:
         
         # Should be between 10 and 1000 Hz
         assert 10 <= config.TRAFFIC_GENERATOR_RATE <= 1000
+        assert 1 <= config.PUBLISH_INTERVAL <= 1000
+        assert 1 <= config.EVALUATION_INTERVAL <= 1000
+        assert config.MOTION_ON_HITS >= 1
+        assert config.MOTION_OFF_HITS >= 1
     
     def test_default_segmentation_window(self):
         """Test default segmentation window is reasonable"""

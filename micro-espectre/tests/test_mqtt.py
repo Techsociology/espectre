@@ -69,6 +69,10 @@ class MockConfig:
     MQTT_USERNAME = "user"
     MQTT_PASSWORD = "pass"
     MQTT_TOPIC = "test/espectre"
+    PUBLISH_INTERVAL = 100
+    EVALUATION_INTERVAL = 25
+    MOTION_ON_HITS = 3
+    MOTION_OFF_HITS = 3
     # SELECTED_SUBCARRIERS is set dynamically by mock_config fixture
     SELECTED_SUBCARRIERS = None
 
@@ -528,6 +532,14 @@ class TestMQTTCommands:
         call_args = mock_mqtt_client_instance.publish.call_args
         payload = json.loads(call_args[0][1])
         assert 'ERROR' in payload['response']
+
+    def test_cmd_segmentation_threshold_below_min(self, commands_instance, mock_mqtt_client_instance):
+        """Test threshold command with value below minimum range."""
+        commands_instance.cmd_segmentation_threshold({'value': -0.1})
+
+        call_args = mock_mqtt_client_instance.publish.call_args
+        payload = json.loads(call_args[0][1])
+        assert 'ERROR' in payload['response']
     
     def test_cmd_segmentation_threshold_invalid_value(self, commands_instance, mock_mqtt_client_instance):
         """Test threshold command with invalid value"""
@@ -584,6 +596,53 @@ class TestMQTTCommands:
         commands_instance.cmd_factory_reset({})
         
         mock_calibration_func.assert_called_once()
+
+    def test_cmd_factory_reset_ml_uses_ml_default_threshold(self, mock_mqtt_client_instance, mock_config, mock_traffic_gen, mock_global_state):
+        """ML factory reset should restore ML threshold default (5.0)."""
+        from mqtt.commands import MQTTCommands
+
+        class MockMLDetector:
+            def __init__(self):
+                self._threshold = 7.2
+                self._state = 0
+                self._motion_metric = 0.0
+
+            def get_name(self):
+                return "ML"
+
+            def get_threshold(self):
+                return self._threshold
+
+            def set_threshold(self, threshold):
+                if 0.0 <= threshold <= 10.0:
+                    self._threshold = threshold
+                    return True
+                return False
+
+            def get_state(self):
+                return self._state
+
+            def get_motion_metric(self):
+                return self._motion_metric
+
+            def reset(self):
+                self._state = 0
+                self._motion_metric = 0.0
+
+        detector = MockMLDetector()
+        commands = MQTTCommands(
+            mock_mqtt_client_instance,
+            mock_config,
+            detector,
+            "test/espectre/response",
+            MockWLAN(),
+            mock_traffic_gen,
+            None,
+            mock_global_state
+        )
+
+        commands.cmd_factory_reset({})
+        assert detector.get_threshold() == 5.0
     
     def test_process_command_info(self, commands_instance, mock_mqtt_client_instance):
         """Test processing info command"""
@@ -641,6 +700,10 @@ class TestMQTTCommands:
         assert 'mqtt' in payload
         assert 'detection' in payload
         assert 'subcarriers' in payload
+        assert payload['detection']['publish_interval'] == 100
+        assert payload['detection']['evaluation_interval'] == 25
+        assert payload['detection']['motion_on_hits'] == 3
+        assert payload['detection']['motion_off_hits'] == 3
     
     def test_cmd_info_with_connected_wlan(self, mock_mqtt_client_instance, mock_config, mock_segmentation, mock_traffic_gen, mock_global_state):
         """Test info command with connected WLAN"""

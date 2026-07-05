@@ -31,9 +31,13 @@ enum class MotionState {
 // DETECTOR CONSTANTS
 // ============================================================================
 
-constexpr uint16_t DETECTOR_DEFAULT_WINDOW_SIZE = 50;
+constexpr uint16_t DETECTOR_DEFAULT_WINDOW_SIZE = 100;
 constexpr uint16_t DETECTOR_MIN_WINDOW_SIZE = 10;
 constexpr uint16_t DETECTOR_MAX_WINDOW_SIZE = 200;
+
+// Calibration buffer size = 10 windows worth of packets
+constexpr uint16_t CALIBRATION_NUM_WINDOWS = 10;
+constexpr uint16_t CALIBRATION_DEFAULT_BUFFER_SIZE = DETECTOR_DEFAULT_WINDOW_SIZE * CALIBRATION_NUM_WINDOWS;
 
 // ============================================================================
 // BASE DETECTOR CLASS
@@ -46,7 +50,6 @@ constexpr uint16_t DETECTOR_MAX_WINDOW_SIZE = 200;
  * - Turbulence buffer management (circular buffer)
  * - Hampel and low-pass filtering
  * - CSI processing and spatial turbulence calculation
- * - Amplitude storage for feature extraction
  * 
  * Subclasses must implement:
  * - update_state(): detection algorithm logic
@@ -81,8 +84,7 @@ public:
      * Process a CSI packet and update internal state
      * 
      * Calculates spatial turbulence from CSI data, applies filtering,
-     * and stores in circular buffer. Also stores amplitudes for feature
-     * extraction by ML detector.
+     * and stores in circular buffer.
      * 
      * @param csi_data Raw CSI data (I/Q interleaved)
      * @param csi_len Length of CSI data
@@ -114,13 +116,6 @@ public:
      * Get total packets processed
      */
     virtual uint32_t get_total_packets() const { return total_packets_; }
-    
-    /**
-     * Set gain compensation factor
-     * 
-     * @param compensation Compensation factor (1.0 = no compensation)
-     */
-    virtual void set_gain_compensation(float compensation) { gain_compensation_ = compensation; }
     
     // ========================================================================
     // PURE VIRTUAL INTERFACE (must be implemented by subclasses)
@@ -181,6 +176,22 @@ public:
                           float threshold = HAMPEL_TURBULENCE_THRESHOLD_DEFAULT);
     
     /**
+     * Configure CV normalization mode
+     * 
+     * CV normalization (std/mean) makes turbulence gain-invariant but reduces
+     * sensitivity for contiguous subcarrier bands (P95). When gain is locked,
+     * raw std is preferred as amplitudes are already stable.
+     * 
+     * @param enabled true = CV normalization (std/mean), false = raw std
+     */
+    virtual void set_cv_normalization(bool enabled);
+    
+    /**
+     * Check if CV normalization is enabled
+     */
+    bool is_cv_normalization_enabled() const { return use_cv_normalization_; }
+    
+    /**
      * Clear turbulence buffer (cold restart)
      */
     void clear_buffer();
@@ -205,16 +216,6 @@ public:
     uint16_t get_window_size() const { return window_size_; }
     
     /**
-     * Get last packet amplitudes (for feature extraction)
-     */
-    const float* get_last_amplitudes() const { return amplitude_buffer_; }
-    
-    /**
-     * Get number of amplitudes stored
-     */
-    uint8_t get_num_amplitudes() const { return num_amplitudes_; }
-    
-    /**
      * Get last turbulence value
      */
     float get_last_turbulence() const;
@@ -237,8 +238,6 @@ protected:
     
     // Buffer state
     float* turbulence_buffer_;
-    float amplitude_buffer_[HT20_SELECTED_BAND_SIZE];  // Last packet amplitudes
-    uint8_t num_amplitudes_;
     uint16_t buffer_index_;
     uint16_t buffer_count_;
     uint16_t window_size_;
@@ -251,7 +250,11 @@ protected:
     // Filters
     hampel_filter_state_t hampel_state_;
     lowpass_filter_state_t lowpass_state_;
-    float gain_compensation_{1.0f};
+    
+    // CV normalization: true = std/mean (gain-invariant), false = raw std
+    // Default false: raw std is more sensitive and matches ML model training
+    // Set true only for chips without gain lock (e.g., ESP32)
+    bool use_cv_normalization_{false};
 };
 
 }  // namespace espectre
